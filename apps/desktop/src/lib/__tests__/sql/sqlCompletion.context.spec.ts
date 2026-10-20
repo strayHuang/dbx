@@ -2732,3 +2732,45 @@ describe("smart unpaired SQL keyword completion before existing keywords (#11527
     expect(keyLabels).not.toContain("UNIQUE KEY");
   });
 });
+
+describe("JOIN condition continuation after a written ON condition", () => {
+  const foreignKeysByTable = new Map([["orders", [{ name: "FK_ORDERS_USERS", column: "user_id", ref_table: "users", ref_column: "id" }]]]);
+  const columnsByTable = new Map([
+    ["users", [{ name: "id", table: "users", dataType: "int" }]],
+    [
+      "orders",
+      [
+        { name: "id", table: "orders", dataType: "int" },
+        { name: "user_id", table: "orders", dataType: "int" },
+      ],
+    ],
+  ]);
+
+  function itemsFor(sql: string) {
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, sql.length), getSqlCompletionContext(sql, sql.length));
+    return buildSqlCompletionItemsFromContext(context, { tables: [], columnsByTable, foreignKeysByTable });
+  }
+
+  it("keeps offering join conditions after a complete ON condition, chaining with AND", () => {
+    const items = itemsFor("select * from users u join orders o on u.status = o.status ");
+    const foreignKey = items.find((item) => item.label === "o.user_id = u.id");
+    const heuristic = items.find((item) => item.label === "u.id = o.user_id");
+
+    expect(foreignKey?.apply).toBe("AND o.user_id = u.id");
+    expect(heuristic?.apply).toBe("AND u.id = o.user_id");
+  });
+
+  it("inserts a bare join condition when the chaining AND is already typed", () => {
+    const items = itemsFor("select * from users u join orders o on u.status = o.status and ");
+    const foreignKey = items.find((item) => item.label === "o.user_id = u.id");
+
+    expect(foreignKey?.apply).toBe("o.user_id = u.id");
+  });
+
+  it("does not chain AND for the first condition right after ON", () => {
+    const items = itemsFor("select * from users u join orders o on ");
+    const foreignKey = items.find((item) => item.label === "o.user_id = u.id");
+
+    expect(foreignKey?.apply).toBe("o.user_id = u.id");
+  });
+});

@@ -578,3 +578,34 @@ describe("CTE 富化边界与熔断", () => {
     expect(neighbor?.bodySources?.map((source) => source.name)).toEqual(["orders"]);
   });
 });
+
+describe("sqlSemanticModel ON clause continuation", () => {
+  it.each([
+    ["select * from users u join orders o on |", false],
+    ["select * from users u join orders o on u.id = o.user_id and |", false],
+    ["select * from users u join orders o on u.id = o.user_id or |", false],
+    ["select * from users u join orders o on u.id = o.user_id |", true],
+    ["select * from users u join orders o on u.id = o.user_id and u.status = |", true],
+  ] as const)("classifies %s as a join-condition slot", (markedSql, continuation) => {
+    const { sql, cursor } = sqlFixtureCursor(markedSql);
+    const model = buildSqlSemanticModel(sql, cursor);
+
+    expect(model.cursorIntent.kind).toBe("join_condition");
+    expect(model.cursorIntent.joinConditionContinuation ?? false).toBe(continuation);
+  });
+
+  it("keeps a WHERE-clause AND as a plain column slot", () => {
+    const { sql, cursor } = sqlFixtureCursor("select * from users u join orders o on u.id = o.user_id where u.active = 1 and |");
+    const model = buildSqlSemanticModel(sql, cursor);
+
+    expect(model.cursorIntent.kind).toBe("column");
+    expect(model.cursorIntent.joinConditionContinuation ?? false).toBe(false);
+  });
+
+  it("keeps qualified column completion after an ON-clause AND", () => {
+    const { sql, cursor } = sqlFixtureCursor("select * from users u join orders o on u.id = o.user_id and o.|");
+    const model = buildSqlSemanticModel(sql, cursor);
+
+    expect(model.cursorIntent.kind).toBe("alias_column");
+  });
+});

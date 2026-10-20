@@ -361,6 +361,12 @@ export function sqlCompletionContextFromSemantic(model: SqlSemanticModel, base: 
   const suggestRoutines = scope.kind === "routine" || (suggestColumns && base.suggestRoutines && !base.exclusiveColumnSuggestions);
   const projectionAliases = sqlSemanticProjectionAliasColumns(model).map((column) => column.name);
 
+  const suggestJoinConditions = model.cursorIntent.kind === "join_condition";
+  // After a SELECT * (or a table-qualified *), the next token is usually FROM,
+  // a comma (more projection), or UNION/LIMIT/… — allow both columns and keyword
+  // suggestions rather than the pure-columns window that the pre-existing
+  // semantic scope grants. Legacy completion also suggests FROM here.
+  const suggestKeywords = scope.kind === "keyword" || (!suggestTables && !suggestColumns && !suggestRoutines) || model.cursorIntent.kind === "star";
   return {
     ...base,
     replacementRange: replacementRangeAlignedWithPrefix(model, prefix, replacementRange),
@@ -369,9 +375,10 @@ export function sqlCompletionContextFromSemantic(model: SqlSemanticModel, base: 
     qualifierParts,
     suggestTables,
     suggestColumns,
-    suggestKeywords: scope.kind === "keyword" || (!suggestTables && !suggestColumns && !suggestRoutines),
+    suggestKeywords,
     suggestRoutines,
-    suggestJoinConditions: model.cursorIntent.kind === "join_condition",
+    suggestJoinConditions,
+    joinConditionContinuation: model.cursorIntent.kind === "join_condition" && model.cursorIntent.joinConditionContinuation === true,
     exclusiveTableSuggestions: suggestTables,
     exclusiveColumnSuggestions: model.cursorIntent.kind === "alias_column" || model.cursorIntent.kind === "insert_column" || model.cursorIntent.kind === "update_column",
     exclusiveRoutineSuggestions: scope.kind === "routine",

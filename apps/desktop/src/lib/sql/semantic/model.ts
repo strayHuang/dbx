@@ -941,6 +941,63 @@ function isTableListContinuation(tokens: readonly SqlSemanticToken[], position: 
   return false;
 }
 
+type OnClauseContinuation = "empty" | "keyword" | "condition" | "none";
+
+/**
+ * Words that close an ON segment when met while scanning backward. `and`/`or` are
+ * deliberately absent: they chain conditions inside the same ON clause.
+ */
+const ON_CLAUSE_BOUNDARY_WORDS = new Set(["select", "from", "where", "join", "inner", "left", "right", "full", "cross", "group", "order", "having", "limit", "offset", "union", "intersect", "except", "window", "qualify", "returning", "values", "set", "using", "by", "on"]);
+
+/**
+ * Classifies the cursor's position inside the nearest ON clause at the same depth:
+ * - "empty": right after `ON`, no condition written yet.
+ * - "keyword": an `AND`/`OR` continuing the clause sits directly before the cursor;
+ *   the keyword is already in the document, so a chosen condition is inserted bare.
+ * - "condition": the clause holds at least one complete condition; a chosen condition
+ *   must carry its own `AND ` prefix.
+ * - "none": not inside an ON clause (WHERE/HAVING/etc. own `AND` there).
+ */
+function onClauseContinuation(before: readonly SqlSemanticToken[], trailing: TrailingIdentifier): OnClauseContinuation {
+  const depth = before.length > 0 ? before[before.length - 1]!.depth : 0;
+  const sameDepth = before.filter((token) => token.kind !== "comment" && token.depth === depth);
+  let index = sameDepth.length - 1;
+  let identifiersToSkip = trailing.qualifierParts.length + (trailing.prefix ? 1 : 0);
+  while (index >= 0 && identifiersToSkip > 0) {
+    if (sameDepth[index]?.text === ".") {
+      index -= 1;
+      continue;
+    }
+    if (!tokenIsIdentifier(sameDepth[index])) break;
+    identifiersToSkip -= 1;
+    index -= 1;
+  }
+  let first = true;
+  let sawLogicalAtTail = false;
+  let sawConditionToken = false;
+  for (; index >= 0; index -= 1) {
+    const token = sameDepth[index];
+    if (!token) continue;
+    if (token.kind === "word") {
+      const word = token.normalized;
+      if (word === "on") return sawLogicalAtTail ? "keyword" : sawConditionToken ? "condition" : "empty";
+      if (word === "and" || word === "or") {
+        if (first) sawLogicalAtTail = true;
+        first = false;
+        continue;
+      }
+      if (ON_CLAUSE_BOUNDARY_WORDS.has(word)) return "none";
+      // Any other word is an identifier taking part in a condition.
+      sawConditionToken = true;
+    } else if (token.text !== ".") {
+      // Operators, literals, parens: all part of a written condition.
+      sawConditionToken = true;
+    }
+    first = false;
+  }
+  return "none";
+}
+
 function hasWordBefore(tokens: readonly SqlSemanticToken[], cursor: number, word: string): boolean {
   return tokens.some((item) => item.span.end <= cursor && item.kind === "word" && item.normalized === word);
 }
@@ -984,7 +1041,12 @@ function buildCursorIntent(tokens: readonly SqlSemanticToken[], cursor: number, 
   const wordBeforeTrailing = wordBeforeTrailingIdentifier(tokens, cursor, trailing);
   const tableListContinuation = isTableListContinuation(tokens, trailing.replacementRange.start);
 
-  if (last?.text === "*" || trailing.prefix === "*") {
+  // Star completion: only when the cursor is actually on (or immediately after) the
+  // star token itself. A space separates `* ` from the star, so in `SELECT * |` the
+  // next token is a keyword (FROM, UNION, …) or another column, not the star expansion.
+  // That keeps the semantic intent from leaking an unhelpful `prefix: "*"` into
+  // contexts that belong to keyword/column completion.
+  if (trailing.prefix === "*" || (last?.text === "*" && cursor <= last!.span.end)) {
     const starIndex = last?.text === "*" ? before.length - 1 : -1;
     const qualifierParts = starIndex >= 0 ? starQualifierParts(before, starIndex, dialect) : trailing.qualifierParts;
     const starTarget = sourceForQualifier(sources, qualifierParts);
@@ -1049,7 +1111,64 @@ function buildCursorIntent(tokens: readonly SqlSemanticToken[], cursor: number, 
   }
 
   if (["where", "on", "and", "or", "having", "by", "select"].includes(previous) && sources.length > 0 && !isBeforeWord(tokens, cursor, "from")) {
-    return { kind: previous === "on" ? "join_condition" : "column", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: ["column"], confidence: "medium" };
+    if (previous === "on") {
+      // 必须在 ON 关键字**之后有空格**才触发 JOIN 条件。
+      // `INNER JOIN x on|`（紧贴 ON 末尾，span.end = cursor）→ 不触发
+      // `INNER JOIN x on |`（ON 后 1 个空格，span.end + 1 = cursor）→ 触发
+      // `INNER JOIN x on  |`（ON 后 2 个空格）→ 触发
+      const onToken =
+        last?.text === "on"
+          ? last
+          : tokens
+              .slice()
+              .reverse()
+              .find((t) => t.text === "on" && t.span.end <= cursor);
+      const hasTrailingSpaceAfterOn = onToken ? cursor > onToken.span.end : true;
+      if (hasTrailingSpaceAfterOn) {
+        return { kind: "join_condition", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: ["column"], confidence: "medium" };
+      }
+      // 没空格，fall through —— 此时让 CodeMirror 正常走 keyword/column 补全
+    }
+    if (previous === "and" || previous === "or") {
+      // `AND`/`OR` inside an ON clause still chains join conditions (the keyword is already
+      // written, so the accepted condition is inserted bare); a WHERE/HAVING `AND` does not.
+      if (onClauseContinuation(before, trailing) === "keyword") {
+        return { kind: "join_condition", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: ["column"], confidence: "medium" };
+      }
+    }
+    return { kind: "column", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: ["column"], confidence: "medium" };
+  }
+
+  // An ON clause keeps offering its join conditions past the first one: after a
+  // written condition (or after the `AND`/`OR` chaining it), the position is still
+  // a join-condition slot rather than a bare keyword/column one.
+  // 注意：这里也需要排除"光标紧贴 ON token 末尾"的情况，和上面的 previous === "on" 保持一致。
+  if (sources.length > 0 && !isBeforeWord(tokens, cursor, "from")) {
+    const continuation = onClauseContinuation(before, trailing);
+    if (continuation === "keyword" || continuation === "condition") {
+      // 排除"光标紧贴 on 末尾"的场景 —— 此时还没输入完 on 后的内容
+      const onToken =
+        last?.text === "on"
+          ? last
+          : tokens
+              .slice()
+              .reverse()
+              .find((t) => t.text === "on" && t.span.end <= cursor);
+      const stillTypedOn = onToken && cursor <= onToken.span.end;
+      if (stillTypedOn) {
+        // 回到 keyword fallback，不返回 join_condition
+      } else {
+        return {
+          kind: "join_condition",
+          prefix: trailing.prefix,
+          replacementRange: trailing.replacementRange,
+          qualifierParts: trailing.qualifierParts,
+          expectedObjectKinds: ["column"],
+          confidence: "medium",
+          joinConditionContinuation: continuation === "condition",
+        };
+      }
+    }
   }
 
   return { kind: "keyword", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: [], confidence: "low", fallbackReason: "keyword_context" };

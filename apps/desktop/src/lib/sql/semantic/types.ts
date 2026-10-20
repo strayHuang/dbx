@@ -142,6 +142,12 @@ export interface SqlSemanticCursorIntent {
   expectedObjectKinds: Array<"database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column">;
   confidence: SqlSemanticConfidence;
   fallbackReason?: string;
+  /**
+   * The ON clause already holds a complete condition (or an `AND`/`OR` continuing it), so an
+   * accepted join condition must insert its own `AND ` prefix instead of replacing a keyword
+   * the user never typed.
+   */
+  joinConditionContinuation?: boolean;
 }
 
 export interface SqlSemanticStatement {

@@ -1560,7 +1560,7 @@ export type SqlCompletionClosingQuote = '"' | "'" | "`" | "]";
 export interface SqlCompletionItem {
   label: string;
   filterText?: string;
-  type: "keyword" | "table" | "column" | "snippet" | "function" | "schema" | "variable" | "sequence" | "text";
+  type: "keyword" | "table" | "column" | "snippet" | "function" | "schema" | "variable" | "sequence" | "text" | "join_condition";
   detail?: string;
   info?: string | ((completion: Completion) => CompletionInfo | Promise<CompletionInfo>);
   apply?: string;
@@ -1637,6 +1637,11 @@ export interface SqlCompletionContext {
   suggestKeywords: boolean;
   suggestRoutines: boolean;
   suggestJoinConditions: boolean;
+  /**
+   * The ON clause already holds a complete condition, so an accepted join condition must insert
+   * its own `AND ` prefix instead of replacing a keyword the user never typed.
+   */
+  joinConditionContinuation?: boolean;
   exclusiveTableSuggestions: boolean;
   exclusiveColumnSuggestions: boolean;
   exclusiveRoutineSuggestions: boolean;
@@ -2014,6 +2019,9 @@ class SqlCompletionProvider {
   }
 }
 
+// 完整子句关键字：正在输入的 token 命中这些词时不自动弹出补全（等空格后再触发）。
+const BARE_CLAUSE_KEYWORD = /^(on|where|and|or|not|from|join|inner|left|right|full|outer|cross|select|having|by|group|order|set|using|values|when|then|else|end|case|limit|offset|union|as|is|in|like|between|distinct|all)$/i;
+
 export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options: SqlSemanticBuildOptions = {}, precomputedContext?: SqlCompletionContext): boolean {
   if (getPostgresSequenceLiteralCompletionContext(sql, cursor, options.databaseType)) return true;
   if (isSqlCompletionSuppressedContext(sql, cursor, options)) return false;
@@ -2025,10 +2033,27 @@ export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options
   // completion trigger O(document) on large scripts.
   const statementSpan = sqlCompletionStatementSpan(sql, cursor, options);
   const beforeCursor = sql.slice(statementSpan.start, cursor);
-  if (/\bon\s+$/i.test(beforeCursor)) return true;
+  // 用户约定：子句关键字 / 通配符 `*` 之后按空格即触发补全（ON → JOIN 条件、FROM → 表、
+  // SELECT * → FROM 关键字等）。这是"除 . 外都在空格后提示"的核心触发点。
+  if (/\b(?:on|where|and|or|having|by|select|from|join|using|set|group|order|values|with|into|update|delete)[ \t]+$/i.test(beforeCursor)) return true;
+  if (/\*[ \t]+$/.test(beforeCursor)) return true;
   if (isAfterJoinModifierContext(beforeCursor, options.databaseType)) return true;
   if (/\bcall\s+(?:[A-Za-z_][\w$]*\.)?$/i.test(beforeCursor)) return true;
   const context = precomputedContext ?? getSqlCompletionContext(sql, cursor, options);
+  // 全局守卫：prefix 为空 + previousChar 是 identifier 字符 + 没有 qualifier →
+  // 说明光标紧贴在 keyword/identifier token 末尾（如 on|, select|, from|），
+  // 用户还没开始输入新 token → 不自动打开 popup，等输入空格或新字符后再触发。
+  // qualifier 场景（table.|）例外 → qualifierTriggered 在 trigger policy 里白名单放行。
+  if (context.prefix.length === 0 && !context.qualifier && /[A-Za-z_$@.\p{Script=Han}]/u.test(previousChar)) {
+    return false;
+  }
+  // 用户设计约定：除 "." 外的补全都应在空格后触发。正在输入的 token 若已经是一个
+  // 完整子句关键字（on / select / from / join / where / and …），说明用户还在打关键字，
+  // 此时不自动打开 popup —— 等打出空格后再由上面的关键字+空格规则触发。
+  // 放在列/表检查之前，否则列上下文会提前 return true 而绕过此守卫。
+  if (BARE_CLAUSE_KEYWORD.test(context.prefix) && /[A-Za-z_$]/u.test(previousChar)) {
+    return false;
+  }
   if (previousChar === "(" && (context.insertTable || context.preferredValueKeywords?.length)) return true;
   if (/[,;()[\]]/.test(previousChar)) return false;
   if (context.exclusiveTableSuggestions || context.exclusiveRoutineSuggestions || context.suggestTables) {
@@ -2036,7 +2061,7 @@ export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options
   }
   if (context.exclusiveColumnSuggestions || shouldAutoOpenColumnCompletion(context, beforeCursor, beforeCursor.length, options.databaseType)) return true;
   if (context.dataTypeContext) return true;
-  return /[A-Za-z_$@.\p{Script=Han}]/u.test(previousChar);
+  return /[A-Za-z_$@.\p{Script=Han}]/u.test(previousChar) && context.prefix.length > 0;
 }
 
 function shouldAutoOpenColumnCompletion(context: SqlCompletionContext, sql: string, cursor: number, databaseType: DatabaseType | undefined): boolean {
@@ -5915,11 +5940,14 @@ function buildJoinConditionItems(context: SqlCompletionContext, columnsByTable: 
   const latest = refs[refs.length - 1];
   const previousRefs = refs.slice(0, -1);
   const items: SqlCompletionItem[] = [];
+  // The ON clause already holds a complete condition: the accepted candidate must chain itself
+  // with its own AND instead of landing right after the previous condition.
+  const andPrefix = context.joinConditionContinuation ? (keywordCase === "lower" ? "and " : "AND ") : "";
 
   for (const previous of previousRefs) {
     const previousColumns = columnsForReferencedTable(previous, columnsByTable);
     const latestColumns = columnsForReferencedTable(latest, columnsByTable);
-    items.push(...buildForeignKeyJoinConditionItemsForPair(previous, latest, foreignKeysByTable, context.prefix, dialect, keywordCase), ...buildJoinConditionItemsForPair(previous, previousColumns, latest, latestColumns, context.prefix, dialect, keywordCase));
+    items.push(...buildForeignKeyJoinConditionItemsForPair(previous, latest, foreignKeysByTable, context.prefix, dialect, keywordCase, andPrefix), ...buildJoinConditionItemsForPair(previous, previousColumns, latest, latestColumns, context.prefix, dialect, keywordCase, andPrefix));
   }
 
   return items;
@@ -5965,15 +5993,23 @@ function foreignKeysForReferencedTable(table: SqlCompletionReferencedTable, fore
   return [];
 }
 
-function buildForeignKeyJoinConditionItemsForPair(left: SqlCompletionReferencedTable, right: SqlCompletionReferencedTable, foreignKeysByTable?: Map<string, SqlCompletionForeignKey[]>, prefix = "", dialect?: SqlCompletionApplyDialect, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+function buildForeignKeyJoinConditionItemsForPair(
+  left: SqlCompletionReferencedTable,
+  right: SqlCompletionReferencedTable,
+  foreignKeysByTable?: Map<string, SqlCompletionForeignKey[]>,
+  prefix = "",
+  dialect?: SqlCompletionApplyDialect,
+  keywordCase?: SqlKeywordCase,
+  andPrefix = "",
+): SqlCompletionItem[] {
   if (!foreignKeysByTable) return [];
   return [
-    ...buildDirectionalForeignKeyJoinConditionItems(left, right, foreignKeysForReferencedTable(left, foreignKeysByTable), prefix, dialect, keywordCase),
-    ...buildDirectionalForeignKeyJoinConditionItems(right, left, foreignKeysForReferencedTable(right, foreignKeysByTable), prefix, dialect, keywordCase),
+    ...buildDirectionalForeignKeyJoinConditionItems(left, right, foreignKeysForReferencedTable(left, foreignKeysByTable), prefix, dialect, keywordCase, andPrefix),
+    ...buildDirectionalForeignKeyJoinConditionItems(right, left, foreignKeysForReferencedTable(right, foreignKeysByTable), prefix, dialect, keywordCase, andPrefix),
   ];
 }
 
-function buildDirectionalForeignKeyJoinConditionItems(owner: SqlCompletionReferencedTable, referenced: SqlCompletionReferencedTable, foreignKeys: SqlCompletionForeignKey[], prefix: string, dialect?: SqlCompletionApplyDialect, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+function buildDirectionalForeignKeyJoinConditionItems(owner: SqlCompletionReferencedTable, referenced: SqlCompletionReferencedTable, foreignKeys: SqlCompletionForeignKey[], prefix: string, dialect?: SqlCompletionApplyDialect, keywordCase?: SqlKeywordCase, andPrefix = ""): SqlCompletionItem[] {
   const matchingForeignKeys = foreignKeys.filter((foreignKey) => referencedTableMatchesName(referenced, foreignKey.ref_table, foreignKey.ref_schema));
   const groups = groupForeignKeysByConstraint(matchingForeignKeys);
   const items: SqlCompletionItem[] = [];
@@ -5983,13 +6019,13 @@ function buildDirectionalForeignKeyJoinConditionItems(owner: SqlCompletionRefere
     const joiner = keywordJoiner(keywordCase);
     const label = parts.map((part) => part.label).join(joiner);
     if (!label || (prefix && !matchesPrefix(label, prefix))) continue;
-    const apply = parts.map((part) => part.apply).join(joiner);
+    const apply = andPrefix + parts.map((part) => part.apply).join(joiner);
     items.push({
       label,
-      type: "snippet",
+      type: "join_condition",
       detail: group.length > 1 ? "JOIN condition from composite foreign key" : "JOIN condition from foreign key",
       apply,
-      boost: 3200 + group.length,
+      boost: 60_000 + group.length,
     });
   }
 
@@ -6037,7 +6073,16 @@ export function normalizeIdentifierPart(name: string): string {
   return name.replace(/^["`[]|["`\]]$/g, "").toLowerCase();
 }
 
-function buildJoinConditionItemsForPair(left: SqlCompletionReferencedTable, leftColumns: SqlCompletionColumn[], right: SqlCompletionReferencedTable, rightColumns: SqlCompletionColumn[], prefix: string, dialect?: SqlCompletionApplyDialect, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+function buildJoinConditionItemsForPair(
+  left: SqlCompletionReferencedTable,
+  leftColumns: SqlCompletionColumn[],
+  right: SqlCompletionReferencedTable,
+  rightColumns: SqlCompletionColumn[],
+  prefix: string,
+  dialect?: SqlCompletionApplyDialect,
+  keywordCase?: SqlKeywordCase,
+  andPrefix = "",
+): SqlCompletionItem[] {
   const items: SqlCompletionItem[] = [];
   const leftRef = left.alias || left.name;
   const rightRef = right.alias || right.name;
@@ -6057,13 +6102,13 @@ function buildJoinConditionItemsForPair(left: SqlCompletionReferencedTable, left
     emittedPairs.add(key);
     const label = `${leftRef}.${leftColumn.name} = ${rightRef}.${rightColumn.name}`;
     if (prefix && !matchesPrefix(label, prefix)) return;
-    const apply = `${leftApplyRef}.${quoteCompletionApplyIdentifier(leftColumn.name, dialect)} = ${rightApplyRef}.${quoteCompletionApplyIdentifier(rightColumn.name, dialect)}`;
+    const apply = `${andPrefix}${leftApplyRef}.${quoteCompletionApplyIdentifier(leftColumn.name, dialect)} = ${rightApplyRef}.${quoteCompletionApplyIdentifier(rightColumn.name, dialect)}`;
     items.push({
       label,
-      type: "snippet",
+      type: "join_condition",
       detail: "JOIN condition",
       apply,
-      boost,
+      boost: 55_000 + boost,
     });
   };
 
@@ -6105,7 +6150,7 @@ function buildJoinConditionItemsForPair(left: SqlCompletionReferencedTable, left
     if (rightName !== "id" && rightName.endsWith("_id")) addPair(leftId, rightColumn, 1650);
   }
 
-  items.push(...buildCompositeHeuristicJoinConditionItems(left, leftColumns, right, leftByName, rightByName, prefix, dialect, keywordCase));
+  items.push(...buildCompositeHeuristicJoinConditionItems(left, leftColumns, right, leftByName, rightByName, prefix, dialect, keywordCase, andPrefix));
 
   return items;
 }
@@ -6130,6 +6175,7 @@ function buildCompositeHeuristicJoinConditionItems(
   prefix: string,
   dialect?: SqlCompletionApplyDialect,
   keywordCase?: SqlKeywordCase,
+  andPrefix = "",
 ): SqlCompletionItem[] {
   const leftId = leftByName.get("id")?.[0];
   const rightId = rightByName.get("id")?.[0];
@@ -6177,10 +6223,10 @@ function buildCompositeHeuristicJoinConditionItems(
     if (prefix && !matchesPrefix(label, prefix)) continue;
     items.push({
       label,
-      type: "snippet",
+      type: "join_condition",
       detail: "Likely composite JOIN condition",
-      apply: parts.map((part) => part.apply).join(joiner),
-      boost: 2400 + parts.length,
+      apply: andPrefix + parts.map((part) => part.apply).join(joiner),
+      boost: 59_000 + parts.length,
     });
   }
 
@@ -6701,6 +6747,10 @@ function dedupeAndSort(items: SqlCompletionItem[]): SqlCompletionItem[] {
 }
 
 function compareCompletionItems(left: SqlCompletionItem, right: SqlCompletionItem): number {
+  // join_condition 排最前（比 variable/sequence 更高优先级）
+  const leftJoinsFirst = left.type === "join_condition";
+  const rightJoinsFirst = right.type === "join_condition";
+  if (leftJoinsFirst !== rightJoinsFirst) return leftJoinsFirst ? -1 : 1;
   const leftSurfacesFirst = left.type === "variable" || left.type === "sequence";
   const rightSurfacesFirst = right.type === "variable" || right.type === "sequence";
   if (leftSurfacesFirst !== rightSurfacesFirst) return leftSurfacesFirst ? -1 : 1;
@@ -6712,6 +6762,8 @@ function compareCompletionItems(left: SqlCompletionItem, right: SqlCompletionIte
 
 function getTypePriorityBoost(type: SqlCompletionItem["type"]): number {
   switch (type) {
+    case "join_condition":
+      return 500;
     case "column":
       return 180;
     case "table":

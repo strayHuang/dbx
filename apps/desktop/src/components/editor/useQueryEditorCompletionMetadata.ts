@@ -496,15 +496,25 @@ export function useQueryEditorCompletionMetadata(options: QueryEditorCompletionM
   async function ensureForeignKeysForTable(table: { name: string; database?: string | null; schema?: string | null }) {
     if (isVirtualCompletionTableReference(table)) return;
     const cacheKey = completionCacheKey(table);
-    if (cachedForeignKeysByTable.has(cacheKey) || !props.connectionId || props.database == null) return;
+    // 只有非空缓存才早返回——空缓存被 delete 掉了，不会永久阻断后续查询
+    const cached = cachedForeignKeysByTable.get(cacheKey);
+    if (cached && cached.length > 0) return;
+    if (!props.connectionId || props.database == null) return;
     const target = completionMetadataTarget(table);
     if (!target) return;
     try {
       const foreignKeys = await connectionStore.listCompletionForeignKeys(props.connectionId, target.database, table.name, target.schema);
-      cachedForeignKeysByTable.set(cacheKey, foreignKeys);
+      if (foreignKeys.length > 0) {
+        cachedForeignKeysByTable.set(cacheKey, foreignKeys);
+        cachedForeignKeysByTable.set(table.name, foreignKeys);
+      } else {
+        cachedForeignKeysByTable.delete(cacheKey);
+        cachedForeignKeysByTable.delete(table.name);
+      }
     } catch (e) {
       console.warn(`[DBX] Failed to load foreign keys for ${cacheKey}:`, e);
-      cachedForeignKeysByTable.set(cacheKey, []);
+      cachedForeignKeysByTable.delete(cacheKey);
+      cachedForeignKeysByTable.delete(table.name);
     }
   }
 

@@ -1003,7 +1003,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
         selectListColumnContext: completionContext.selectListColumnContext,
       });
       const shouldResolveAsyncCompletion = tableNameCompletion || shouldResolveColumnCompletion;
-      const localResult = buildLocalSqlCompletionResult(completionContext, fullDoc, position, completionScope);
+      const localResult = await buildLocalSqlCompletionResult(completionContext, fullDoc, position, completionScope);
       if (localResult) {
         scheduleCompletionMetadataRefresh(completionContext, fullDoc, position, completionScope);
         const hasLocalColumnResult = localResult.options.some((option) => option.type === "column");
@@ -1149,7 +1149,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     return shouldTriggerSqlCompletionForPosition(fullDoc, position);
   }
 
-  function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getSqlCompletionContext>, fullDoc: string, position: number, scope: CompletionMetadataScope) {
+  async function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getSqlCompletionContext>, fullDoc: string, position: number, scope: CompletionMetadataScope) {
     if (!props.connectionId || props.database == null) return null;
     const databaseNames = localCompletionDatabaseNames(completionContext);
     const currentDatabaseSchemaNames = localCompletionSchemasForDatabaseDisambiguation(completionContext, databaseNames, scope);
@@ -1211,6 +1211,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       const cached = cachedPrefix ?? cachedColumnsByTable.get(cacheKey);
       if (cached) {
         columnsByTable.set(cacheKey, cached);
+        columnsByTable.set(qualifiedColumnTarget.name, cached);
       } else {
         const target = completionMetadataTarget(qualifiedColumnTarget, scope);
         const prefixColumns =
@@ -1225,6 +1226,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
               : [];
         if (localColumns.length > 0) {
           columnsByTable.set(cacheKey, localColumns);
+          columnsByTable.set(qualifiedColumnTarget.name, localColumns);
         }
       }
     }
@@ -1263,6 +1265,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       const cached = (prefixCompletion ? lookupCachedPrefixColumns(refTable, scope, prefixCompletion) : undefined) ?? cachedColumnsByTable.get(cacheKey);
       if (cached) {
         columnsByTable.set(cacheKey, cached);
+        columnsByTable.set(refTable.name, cached);
         continue;
       }
       const target = completionMetadataTarget(refTable, scope);
@@ -1270,10 +1273,63 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       const localColumns = prefixColumns.length > 0 ? prefixColumns : target && !usesOracleSessionCompletionColumns(target.schema) ? connectionStore.lookupLocalCompletionColumns(props.connectionId, target.database, refTable.name, target.schema, target.catalog, refTable) : [];
       if (localColumns.length > 0) {
         columnsByTable.set(cacheKey, localColumns);
+        columnsByTable.set(refTable.name, localColumns);
       }
       const localForeignKeys = target ? connectionStore.lookupLocalCompletionForeignKeys(props.connectionId, target.database, refTable.name, target.schema) : [];
       if (localForeignKeys.length > 0) {
         cachedForeignKeysByTable.set(cacheKey, localForeignKeys);
+        cachedForeignKeysByTable.set(refTable.name, localForeignKeys);
+      }
+    }
+
+    // Join-condition 场景：首次连接时本地缓存通常为空。同步返回会导致
+    // buildJoinConditionItems 拿不到列/FK → JOIN 条件列表为空。这里主动
+    // await 远端加载再 build items，让用户 ON + 空格后 popup 直接带出条件。
+    if (completionContext.suggestJoinConditions && completionContext.referencedTables.length >= 2) {
+      const missingRefs: typeof completionContext.referencedTables = [];
+      for (const refTable of completionContext.referencedTables) {
+        if (refTable.columns?.length) continue; // CTE 已经有列定义
+        if (isVirtualCompletionTableReference(refTable)) continue;
+        const cacheKey = completionCacheKey(refTable, scope);
+        if (columnsByTable.has(cacheKey)) continue;
+        if (cachedColumnsByTable.has(cacheKey)) continue;
+        const target = completionMetadataTarget(refTable, scope);
+        if (!target) continue;
+        missingRefs.push(refTable);
+      }
+
+      if (missingRefs.length > 0) {
+        // 并发加载所有缺失表的列
+        const columnResults = await Promise.all(
+          missingRefs.map(async (refTable) => {
+            const target = completionMetadataTarget(refTable, scope)!;
+            return {
+              refTable,
+              cacheKey: completionCacheKey(refTable, scope),
+              columns: await refreshCompletionColumnsForEditor(connectionId, target.database, refTable.name, target.schema, target.catalog, refTable),
+            };
+          }),
+        );
+        for (const { refTable, cacheKey, columns } of columnResults) {
+          if (columns.length > 0) {
+            columnsByTable.set(cacheKey, columns);
+            cachedColumnsByTable.set(cacheKey, columns);
+            columnsByTable.set(refTable.name, columns);
+          }
+          // 同时尝试从 CTE 定义里取
+          if (refTable.columns?.length) {
+            columnsByTable.set(
+              refTable.name,
+              refTable.columns.map((name) => ({ name, table: refTable.name, schema: refTable.schema })),
+            );
+          }
+        }
+      }
+
+      // 并发加载 FK
+      const foreignKeyTargets = completionContext.referencedTables.filter((t) => !isVirtualCompletionTableReference(t) && completionMetadataTarget(t, scope));
+      if (foreignKeyTargets.length > 0) {
+        await ensureForeignKeysForTables(foreignKeyTargets);
       }
     }
 
@@ -1394,7 +1450,9 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       if (target) {
         void refreshCompletionColumnsForEditor(connectionId, target.database, qualifiedColumnTarget.name, target.schema, target.catalog)
           .then((columns) => {
-            if (columns.length > 0) cachedColumnsByTable.set(qualifiedColumnCacheKey, columns);
+            if (columns.length > 0) {
+              cachedColumnsByTable.set(qualifiedColumnCacheKey, columns);
+            }
           })
           .catch(() => {});
       }
@@ -1410,7 +1468,9 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
         if (!target) continue;
         void refreshCompletionColumnsForEditor(connectionId, target.database, refTable.name, target.schema, target.catalog, refTable)
           .then((columns) => {
-            if (columns.length > 0) cachedColumnsByTable.set(cacheKey, columns);
+            if (columns.length > 0) {
+              cachedColumnsByTable.set(cacheKey, columns);
+            }
           })
           .catch(() => {});
       }
