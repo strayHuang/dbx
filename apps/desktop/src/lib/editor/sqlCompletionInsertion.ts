@@ -1,4 +1,4 @@
-export type SqlCompletionItemType = "keyword" | "table" | "column" | "snippet" | "function" | "schema" | "variable" | "sequence" | "property" | "text";
+export type SqlCompletionItemType = "keyword" | "table" | "column" | "snippet" | "function" | "schema" | "variable" | "sequence" | "property" | "text" | "join_condition";
 
 // `;` is deliberately absent: a statement terminator is never glued to the token
 // in front of it, and accepting `BETWEEN` before an existing `;` used to insert

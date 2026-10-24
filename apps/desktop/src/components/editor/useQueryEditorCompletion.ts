@@ -1306,7 +1306,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
             return {
               refTable,
               cacheKey: completionCacheKey(refTable, scope),
-              columns: await refreshCompletionColumnsForEditor(connectionId, target.database, refTable.name, target.schema, target.catalog, refTable),
+              columns: await refreshCompletionColumnsForEditor(props.connectionId!, target.database, refTable.name, target.schema, target.catalog, refTable),
             };
           }),
         );
