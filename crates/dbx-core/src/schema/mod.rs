@@ -5,7 +5,7 @@ pub use dbx_drivers::metadata::sqlite_ddl;
 use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::connection::{
     connection_url_for_endpoint, database_connection_config, gaussdb_uses_m_jdbc_driver, task_client_session_id,
-    uses_metadata_gate, AppState, MysqlMode, PoolKind, METADATA_POOL_ACQUIRE_TIMEOUT,
+    uses_metadata_gate, AppState, MysqlMode, PoolKind,
 };
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
@@ -96,7 +96,9 @@ macro_rules! try_sqlserver {
 async fn lock_sqlserver_metadata_client<'a>(
     client: &'a Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>,
 ) -> Result<tokio::sync::MutexGuard<'a, db::sqlserver::SqlServerClient>, String> {
-    lock_metadata_mutex_with_timeout(client, METADATA_POOL_ACQUIRE_TIMEOUT).await
+    // SQL Server 的所有元数据查询共用同一个客户端连接，排队等待是正常路径。
+    // 5 秒上限会让慢实例上的对象列表请求直接报 "metadata pool is busy"。
+    lock_metadata_mutex_with_timeout(client, crate::connection::METADATA_POOL_SQLSERVER_ACQUIRE_TIMEOUT).await
 }
 
 async fn lock_metadata_mutex_with_timeout<T>(

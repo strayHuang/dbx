@@ -67,6 +67,11 @@ const HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
 /// `ensureConnected`) hang for the whole OS retry window.
 const HEALTH_CHECK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const METADATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// SQL Server 的元数据请求全部串行在同一个客户端互斥锁上（见
+/// `lock_sqlserver_metadata_client`），排队本身是正常行为而不是错误。沿用 5 秒上限会让
+/// 慢实例上的对象列表、列/索引等请求频繁以 "DBX metadata pool is busy" 失败，因此给
+/// 它更宽的等待预算，让请求排队后仍能返回结果。
+pub(crate) const METADATA_POOL_SQLSERVER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const METADATA_POOL_DEFAULT_LIMIT: usize = 6;
 pub(crate) const METADATA_POOL_SQLSERVER_LIMIT: usize = 1;
 
@@ -1822,7 +1827,12 @@ impl AppState {
         };
         let started = Instant::now();
         let queued = gate.available_permits() == 0;
-        let permit = match tokio::time::timeout(METADATA_POOL_ACQUIRE_TIMEOUT, gate.acquire_owned()).await {
+        let acquire_timeout = if db_type == DatabaseType::SqlServer {
+            METADATA_POOL_SQLSERVER_ACQUIRE_TIMEOUT
+        } else {
+            METADATA_POOL_ACQUIRE_TIMEOUT
+        };
+        let permit = match tokio::time::timeout(acquire_timeout, gate.acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(crate::query::METADATA_POOL_BUSY_ERROR.to_string()),
             Err(_) => {
