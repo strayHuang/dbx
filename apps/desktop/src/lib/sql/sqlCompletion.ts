@@ -829,6 +829,9 @@ function isPairPrefixKeywordForFollowing(keyword: string, followingKeyword: stri
 const MAX_TABLE_COMPLETION_ITEMS = 200;
 const EXACT_LABEL_MATCH_BOOST = 10000;
 const EXACT_CUSTOM_SNIPPET_TRIGGER_BOOST = 40000;
+// 输入 JOIN 修饰词（inn/le/ri/fu/cr/na…）时，"INNER JOIN"/"LEFT JOIN" 这类完整短语
+// 必须排在模板与其他关键字之前，且只插入纯关键字文本（不带 ON 条件模板）。
+const JOIN_MODIFIER_KEYWORD_BOOST = 60_000;
 
 function isTableTriggerKeyword(keyword: string, options: SqlSemanticBuildOptions): boolean {
   const dialectId = resolveSqlDialectId(options);
@@ -6303,6 +6306,9 @@ export function buildSnippetItemsForTest(prefix: string, snippets: SqlSnippet[],
 
 function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?: SqlKeywordCase, databaseType?: DatabaseType): SqlCompletionItem[] {
   if (!prefix) return [];
+  // 单字符前缀（如 "s"）会同时命中大量 snippet 前缀和真实关键字。此时用户是在
+  // 输入关键字本身（"s" → SELECT），模板不应抢占第一位。
+  const keywordOutranksSnippet = prefix.length === 1 && activeSqlKeywords(databaseType).some((keyword) => keyword.toLowerCase().startsWith(prefix.toLowerCase()));
   return snippets
     .filter((snippet) => {
       if (snippet.enabled === false) return false;
@@ -6318,7 +6324,7 @@ function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?:
       // When the user types past the snippet prefix (e.g. "sele" vs prefix "sel"),
       // they are likely typing the actual keyword — reduce the base boost so
       // the real keyword can rank higher.
-      const baseBoost = matchesByPrefix ? 4000 : 0;
+      const baseBoost = matchesByPrefix && !keywordOutranksSnippet ? 4000 : 0;
       // Placeholder replacement runs on the original (UPPER-case) body first,
       // then keyword casing is applied to both variants uniformly.
       const resolvedBody = resolveSqlSnippetBodyForDatabase(snippet, databaseType);
@@ -6331,7 +6337,7 @@ function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?:
         detail: body,
         apply,
         exactMatch: isExactCustomTrigger || undefined,
-        boost: Math.max(boostByPrefix, boostByLabel) + baseBoost + (isExactCustomTrigger ? EXACT_CUSTOM_SNIPPET_TRIGGER_BOOST : 0),
+        boost: Math.max(boostByPrefix, boostByLabel) + baseBoost + (isExactCustomTrigger && !keywordOutranksSnippet ? EXACT_CUSTOM_SNIPPET_TRIGGER_BOOST : 0),
       };
     });
 }
@@ -6547,12 +6553,16 @@ function buildJoinModifierKeywordItems(prefix: string, keywordCase?: SqlKeywordC
     .filter((keyword) => matchesPrefix(keyword, prefix))
     .map((keyword) => {
       const label = applySqlKeywordCase(keyword, keywordCase);
+      // 只有用户从修饰词词首输入两个及以上字符（"inn"、"le"、"ri"…）时才把完整短语置顶。
+      // 单字符前缀歧义太大（"r" 同时是 REPLACE、RIGHT JOIN 等），"out" 这类前缀会模糊
+      // 命中 "LEFT OUTER JOIN"，那里用户更可能要 OUTER APPLY，都不能劫持第一位。
+      const headMatched = prefix.length >= 2 && keyword.split(" ")[0]!.toLowerCase().startsWith(prefix.toLowerCase());
       return {
         label,
         type: "keyword" as const,
         apply: followingKeyword === "JOIN" ? undefined : `${label} `,
         detail: "join keyword",
-        boost: computeBoost(keyword, prefix) + 1300,
+        boost: computeBoost(keyword, prefix) + (headMatched ? JOIN_MODIFIER_KEYWORD_BOOST : 1300),
       };
     });
 }
@@ -6581,11 +6591,17 @@ function buildKeywordItems(prefix: string, context: SqlCompletionContext, databa
       const freqBoost = !context.dataTypeContext && HIGH_FREQUENCY_KEYWORDS.has(keyword) ? 100 : 0;
       const typeBoost = context.dataTypeContext && isDataType ? 2500 : 0;
       const followingBoost = context.followingKeyword && isPairPrefixKeywordForFollowing(keyword, context.followingKeyword) ? 1300 : 0;
+      // 单字符前缀（"s"）在语句起始处会同时命中系统变量缩写（"@@SPID" 的 initials 是 s）
+      // 和函数，单纯按匹配分排序会让它们压过用户正在输入的关键字。这里只在该位置没有
+      // 列候选（即用户不是在写列名）时抬高以该字符开头的关键字，并让 SELECT 保持第一。
+      const singleCharKeywordPrefix = prefix.length === 1 && !context.suggestColumns;
+      const headMatchBoost = singleCharKeywordPrefix && keyword.toLowerCase().startsWith(prefix.toLowerCase()) ? 3000 : 0;
+      const leadKeywordBoost = singleCharKeywordPrefix && keyword === "SELECT" ? 5 : 0;
       return {
         label: applySqlKeywordCase(keyword, keywordCase),
         type: "keyword" as const,
         detail: isDataType ? "data type" : undefined,
-        boost: base + freqBoost + typeBoost + followingBoost,
+        boost: base + freqBoost + typeBoost + followingBoost + headMatchBoost + leadKeywordBoost,
       };
     });
 }
