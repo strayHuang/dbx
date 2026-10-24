@@ -994,7 +994,7 @@ export function useSqlExecution(deps: {
     const result = await queryStore.diagnoseTabSql(tab.id, sql, databaseType);
     if (!result.ok) {
       const current = resolveExecutionTab(context.tabId);
-      if (current?.diagnosisError) toast(current.diagnosisError, 5000);
+      toast(current?.diagnosisError || t("diagnostics.failed"), 5000);
     }
   }
 
@@ -1002,7 +1002,10 @@ export function useSqlExecution(deps: {
     const sourceTab = resolveExecutionTab(options.tabId);
     if (sourceTab && isObjectDependencySection(sourceTab)) return;
     const context = captureExecutionContext(options.tabId);
-    if (!context) return;
+    if (!context) {
+      toast(t("diagnostics.noContext"), 5000);
+      return;
+    }
     const { sql, sourceOffset } = await resolvedExecutableSql(sqlOverride, context);
     if (!sql.trim()) {
       toast(t("explain.emptySql"));

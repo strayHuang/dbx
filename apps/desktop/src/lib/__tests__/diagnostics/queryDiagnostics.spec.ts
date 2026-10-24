@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { ParsedExplainPlan } from "@/lib/diagram/explainPlan";
-import { buildCacheClearPlan, buildRewriteCandidates, diagnoseQueryPlan, extractReferencedRelations, extractPostgresFilterColumns, rewriteLiteralInLists, rewriteLowerLike, sqlShapeFindings } from "@/lib/diagnostics/queryDiagnostics";
+import { buildCacheClearPlan, buildIndexSuggestionsFromSql, buildRewriteCandidates, diagnoseQueryPlan, extractReferencedRelations, extractPostgresFilterColumns, rewriteLiteralInLists, rewriteLowerLike, sqlShapeFindings } from "@/lib/diagnostics/queryDiagnostics";
 
 const SQL_SERVER_XML = `<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
   <BatchSequence><Batch><Statements><StmtSimple StatementText="SELECT * FROM dbo.OTM o JOIN dbo.SAL s ON o.id = s.id WHERE o.shpcode = 'A'">
@@ -74,11 +74,12 @@ describe("query diagnostics", () => {
 
   it("turns SQL Server MissingIndexes into a CREATE INDEX statement", () => {
     const diagnosis = diagnoseQueryPlan(sqlServerPlan(), "SELECT * FROM dbo.OTM o JOIN dbo.SAL s ON o.id = s.id WHERE o.shpcode = 'A'");
-    expect(diagnosis.indexSuggestions).toHaveLength(1);
-    expect(diagnosis.indexSuggestions[0]?.table).toBe("dbo.OTM");
-    expect(diagnosis.indexSuggestions[0]?.sql).toContain("CREATE NONCLUSTERED INDEX");
-    expect(diagnosis.indexSuggestions[0]?.sql).toContain("([shpcode], [stdate]) INCLUDE ([qty])");
-    expect(diagnosis.indexSuggestions[0]?.impact).toBe(92.5);
+    expect(diagnosis.indexSuggestions.length).toBeGreaterThanOrEqual(1);
+    const missingIndex = diagnosis.indexSuggestions.find((entry) => entry.impact === 92.5);
+    expect(missingIndex?.table).toBe("dbo.OTM");
+    expect(missingIndex?.sql).toContain("CREATE NONCLUSTERED INDEX");
+    expect(missingIndex?.sql).toContain("([shpcode], [stdate]) INCLUDE ([qty])");
+    expect(missingIndex?.impact).toBe(92.5);
     expect(diagnosis.metrics.elapsedMs).toBe(2400);
     expect(diagnosis.metrics.cpuMs).toBe(1800);
     expect(diagnosis.findings.some((finding) => finding.code === "sqlserver.implicit-conversion")).toBe(true);
@@ -140,5 +141,24 @@ describe("query diagnostics", () => {
     const result = rewriteLowerLike("select * from t where lower(name) like lower('abc%')");
     expect(result.changed).toBe(true);
     expect(result.sql).toBe("select * from t where name ILIKE 'abc%'");
+  });
+
+  it("derives a composite covering index from join predicates, IN lists and aggregate columns", () => {
+    const sql = `select shpentry, sum(valueemp)/10000 valuetotal
+from qstest_yj_valuedetail t1 inner join(
+select min(u0.startdate) startdate,max(u0.enddate) enddate from qstest_ofpr u0
+inner join qstest_ofpr u1 on '2026'=extract(year from u1.startdate)
+)t2 on t1.docdate between t2.startdate and t2.enddate
+and t1.shpentry in ( 2,3,6,7,8,10 )
+group by shpentry`;
+    const suggestions = buildIndexSuggestionsFromSql(sql, "postgres").filter((entry) => entry.table === "qstest_yj_valuedetail");
+    expect(suggestions).toHaveLength(2);
+    const equalityFirst = suggestions[0]!;
+    expect(equalityFirst.columns).toEqual(["shpentry", "docdate"]);
+    expect(equalityFirst.includeColumns).toEqual(["valueemp"]);
+    expect(equalityFirst.sql).toContain("(shpentry, docdate) INCLUDE (valueemp)");
+    const rangeFirst = suggestions[1]!;
+    expect(rangeFirst.columns).toEqual(["docdate", "shpentry"]);
+    expect(rangeFirst.sql).toContain("(docdate, shpentry) INCLUDE (valueemp)");
   });
 });

@@ -409,7 +409,7 @@ export function diagnoseQueryPlan(plan: ParsedExplainPlan, sql: string): QueryDi
       databaseType: plan.databaseType,
       metrics: { elapsedMs: facts.elapsedMs, cpuMs: facts.cpuMs, logicalReads: facts.logicalReads },
       findings: dedupeFindings([...facts.findings, ...sqlShapeFindings(sql, "sqlserver")]),
-      indexSuggestions: facts.indexes,
+      indexSuggestions: mergeIndexSuggestions(facts.indexes, buildIndexSuggestionsFromSql(sql, "sqlserver")),
       rewriteCandidates: buildRewriteCandidates(sql, new Set(facts.relations.map((relation) => relation.split(".").pop()?.toLowerCase() ?? "")), "sqlserver"),
     };
   }
@@ -424,11 +424,276 @@ export function diagnoseQueryPlan(plan: ParsedExplainPlan, sql: string): QueryDi
         sharedReadBlocks: facts.sharedReadBlocks,
       },
       findings: dedupeFindings([...facts.findings, ...sqlShapeFindings(sql, "postgres")]),
-      indexSuggestions: facts.indexes,
+      indexSuggestions: mergeIndexSuggestions(facts.indexes, buildIndexSuggestionsFromSql(sql, "postgres")),
       rewriteCandidates: buildRewriteCandidates(sql, new Set(facts.relations.map((relation) => relation.split(".").pop()?.toLowerCase() ?? "")), "postgres"),
     };
   }
   return { databaseType: plan.databaseType, metrics: {}, findings: sqlShapeFindings(sql), indexSuggestions: [], rewriteCandidates: [] };
+}
+
+function mergeIndexSuggestions(planSuggestions: QueryIndexSuggestion[], sqlSuggestions: QueryIndexSuggestion[]): QueryIndexSuggestion[] {
+  const seen = new Set<string>();
+  const merged: QueryIndexSuggestion[] = [];
+  for (const suggestion of [...planSuggestions, ...sqlSuggestions]) {
+    const key = `${suggestion.table.toLowerCase()}\0${suggestion.columns.map((column) => column.toLowerCase()).join(",")}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(suggestion);
+  }
+  return merged;
+}
+
+interface SqlTableAlias {
+  /** Alias as written in the query (`t1`). */
+  alias: string;
+  /** Table name possibly schema-qualified (`public.orders`). */
+  table: string;
+}
+
+const RESERVED_ALIAS_WORDS = new Set([
+  "where",
+  "join",
+  "on",
+  "inner",
+  "left",
+  "right",
+  "full",
+  "outer",
+  "cross",
+  "natural",
+  "group",
+  "order",
+  "having",
+  "limit",
+  "offset",
+  "union",
+  "except",
+  "intersect",
+  "window",
+  "qualify",
+  "returning",
+  "values",
+  "set",
+  "using",
+  "as",
+  "and",
+  "or",
+  "not",
+  "select",
+  "from",
+]);
+
+/** Maps aliases to base tables, ignoring derived tables (`from (select …) t2`). */
+function extractSqlTableAliases(sql: string): SqlTableAlias[] {
+  const aliases: SqlTableAlias[] = [];
+  const seen = new Set<string>();
+  const pattern = /\b(?:from|join)\s+(?!\()([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)\s*(?:(?:as)\s+)?([A-Za-z_][\w$]*)?/gi;
+  for (const match of sql.matchAll(pattern)) {
+    const table = match[1];
+    if (!table) continue;
+    const candidate = match[2];
+    const alias = candidate && !RESERVED_ALIAS_WORDS.has(candidate.toLowerCase()) ? candidate : (table.split(".").pop() ?? table);
+    const key = alias.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    aliases.push({ alias, table });
+  }
+  return aliases;
+}
+
+const NON_COLUMN_WORDS = new Set([
+  "select",
+  "from",
+  "where",
+  "group",
+  "by",
+  "order",
+  "having",
+  "limit",
+  "offset",
+  "as",
+  "distinct",
+  "all",
+  "and",
+  "or",
+  "not",
+  "case",
+  "when",
+  "then",
+  "else",
+  "end",
+  "null",
+  "true",
+  "false",
+  "is",
+  "in",
+  "between",
+  "like",
+  "ilike",
+  "exists",
+  "union",
+  "sum",
+  "avg",
+  "count",
+  "min",
+  "max",
+  "cast",
+  "convert",
+  "coalesce",
+  "isnull",
+  "extract",
+  "date_trunc",
+  "to_char",
+  "left",
+  "right",
+  "inner",
+  "outer",
+  "full",
+  "cross",
+  "natural",
+  "join",
+  "on",
+  "asc",
+  "desc",
+  "over",
+  "partition",
+  "window",
+  "filter",
+]);
+
+/**
+ * Derives composite covering-index suggestions directly from the query text.
+ *
+ * Execution plans only expose the predicates the optimizer chose to report
+ * (SQL Server MissingIndexes, PostgreSQL per-row Filters), so BETWEEN range
+ * joins, IN lists and aggregate inputs are routinely missing. This pass reads
+ * WHERE/ON predicates per alias, then adds SELECT/GROUP BY/aggregate columns as
+ * INCLUDE columns: equality columns first, range columns after them.
+ */
+export function buildIndexSuggestionsFromSql(sql: string, databaseType: string): QueryIndexSuggestion[] {
+  const aliases = extractSqlTableAliases(sql);
+  if (aliases.length === 0) return [];
+  const aliasSet = new Map(aliases.map((entry) => [entry.alias.toLowerCase(), entry]));
+  // Strip comments and string literals before scanning so values never look like columns.
+  const scan = sql
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/'(?:''|[^'])*'/g, "''");
+
+  const buckets = new Map<string, { equality: string[]; range: string[]; include: string[] }>();
+  const bucketFor = (alias: string) => {
+    const key = alias.toLowerCase();
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = { equality: [], range: [], include: [] };
+      buckets.set(key, bucket);
+    }
+    return bucket;
+  };
+  const pushUnique = (list: string[], value: string) => {
+    const normalized = value.toLowerCase();
+    if (!list.some((existing) => existing.toLowerCase() === normalized)) list.push(value);
+  };
+
+  // Predicate classification from each `alias.column` reference.
+  const columnReference = /([A-Za-z_][\w$]*)\.([A-Za-z_][\w$]*)/g;
+  for (const match of scan.matchAll(columnReference)) {
+    const alias = match[1]!.toLowerCase();
+    const column = match[2]!;
+    if (!aliasSet.has(alias)) continue;
+    const rest = scan.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 48);
+    const bucket = bucketFor(alias);
+    if (/^\s+between\b/i.test(rest)) {
+      pushUnique(bucket.range, column);
+    } else if (/^\s+in\s*\(/i.test(rest)) {
+      pushUnique(bucket.equality, column);
+    } else if (/^\s*(?:=|<>|!=)\s*(?:'|\?|\d|any\s*\(|array\[|null)/i.test(rest)) {
+      pushUnique(bucket.equality, column);
+    } else if (/^\s*(?:>=|<=|>|<)\s*(?:'|\?|\d|any\s*\(|array\[)/i.test(rest)) {
+      pushUnique(bucket.range, column);
+    } else {
+      // Join equality: `a.x = b.y` marks x on a as a key column.
+      const joinEquality = /^\s*=\s*([A-Za-z_][\w$]*)\.[A-Za-z_][\w$]*/i.exec(rest);
+      if (joinEquality && aliasSet.has(joinEquality[1]!.toLowerCase())) pushUnique(bucket.equality, column);
+    }
+  }
+
+  // SELECT list, GROUP BY and aggregate inputs become INCLUDE candidates.
+  const selectMatch = /\bselect\b([\s\S]*?)\bfrom\b/i.exec(scan);
+  const groupMatch = /\bgroup\s+by\b([\s\S]*?)(?:\b(?:having|order\s+by|limit|offset)\b|$)/i.exec(scan);
+  const referenced = new Map<string, string[]>();
+  const addReferenced = (alias: string, column: string) => {
+    const key = alias.toLowerCase();
+    let list = referenced.get(key);
+    if (!list) {
+      list = [];
+      referenced.set(key, list);
+    }
+    pushUnique(list, column);
+  };
+  // Unqualified SELECT/GROUP BY columns belong to the primary FROM relation.
+  const primaryAlias = aliases[0]?.alias.toLowerCase();
+  for (const source of [selectMatch?.[1] ?? "", groupMatch?.[1] ?? ""]) {
+    for (const match of source.matchAll(columnReference)) {
+      const alias = match[1]!.toLowerCase();
+      if (!aliasSet.has(alias)) continue;
+      addReferenced(alias, match[2]!);
+    }
+    if (primaryAlias) {
+      for (const match of source.matchAll(/\b([A-Za-z_][\w$]*)\b(?!\s*\()/g)) {
+        const word = match[1]!;
+        const lower = word.toLowerCase();
+        if (NON_COLUMN_WORDS.has(lower) || aliasSet.has(lower) || /^\d/.test(word)) continue;
+        // Skip projection aliases: they follow a closing paren or a numeric literal.
+        const before = source.slice(Math.max(0, (match.index ?? 0) - 16), match.index ?? 0);
+        if (/[)\d]\s*$/.test(before)) continue;
+        addReferenced(primaryAlias, word);
+      }
+    }
+  }
+
+  const suggestions: QueryIndexSuggestion[] = [];
+  for (const [aliasKey, bucket] of buckets) {
+    const entry = aliasSet.get(aliasKey);
+    if (!entry) continue;
+    const keyColumns = [...bucket.equality, ...bucket.range].slice(0, 4);
+    if (keyColumns.length === 0) continue;
+    const includeColumns = (referenced.get(aliasKey) ?? []).filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase())).slice(0, 6);
+    suggestions.push(buildIndexSuggestionSql(entry.table, keyColumns, includeColumns, databaseType, "equality-first"));
+    // 等值与范围列都存在时，同时给出范围列在前的对照方案，便于实际执行后对比。
+    if (bucket.equality.length > 0 && bucket.range.length > 0) {
+      const rangeFirst = [...bucket.range, ...bucket.equality].slice(0, 4);
+      suggestions.push(buildIndexSuggestionSql(entry.table, rangeFirst, includeColumns, databaseType, "range-first"));
+    }
+  }
+  return suggestions;
+}
+
+function buildIndexSuggestionSql(table: string, columns: string[], includeColumns: string[], databaseType: string, variant: "equality-first" | "range-first"): QueryIndexSuggestion {
+  const [schema, name] = table.includes(".") ? (table.split(".") as [string, string]) : [undefined, table];
+  const reason = variant === "equality-first" ? "来自 SQL 谓词与输出列推导（等值列在前、范围列在后，输出列放 INCLUDE）" : "对照方案：范围列在前（部分优化器在范围选择性更高时更优），输出列放 INCLUDE";
+  if (databaseType === "sqlserver") {
+    const suffix = variant === "range-first" ? "_R" : "";
+    const indexName = `IX_${name.replace(/[^\w]/g, "")}_${columns.map((column) => column.replace(/[^\w]/g, "")).join("_")}${suffix}`.slice(0, 120);
+    const target = `[${schema ?? "dbo"}].[${name}]`;
+    const includeClause = includeColumns.length > 0 ? ` INCLUDE (${includeColumns.map((column) => `[${column}]`).join(", ")})` : "";
+    return {
+      table: `${schema ?? "dbo"}.${name}`,
+      columns,
+      includeColumns,
+      sql: `CREATE NONCLUSTERED INDEX ${indexName}\nON ${target} (${columns.map((column) => `[${column}]`).join(", ")})${includeClause};`,
+      reason,
+    };
+  }
+  const quotedTable = schema ? `${quoteIdentifier(schema)}.${quoteIdentifier(name)}` : quoteIdentifier(name);
+  const includeClause = includeColumns.length > 0 ? ` INCLUDE (${includeColumns.map((column) => quoteIdentifier(column)).join(", ")})` : "";
+  return {
+    table: schema ? `${schema}.${name}` : name,
+    columns,
+    includeColumns,
+    sql: `CREATE INDEX ON ${quotedTable} (${columns.map((column) => quoteIdentifier(column)).join(", ")})${includeClause};`,
+    reason,
+  };
 }
 
 function dedupeFindings(findings: QueryDiagnosticFinding[]): QueryDiagnosticFinding[] {

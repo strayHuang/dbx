@@ -3708,6 +3708,8 @@ export default withEnglishFallback({
     empty: "清空缓存后实际执行查询，分析执行计划并对比改写方案",
     unsupported: "性能诊断目前仅支持 SQL Server 和 PostgreSQL",
     noPlan: "未取得执行计划",
+    noContext: "无法确定当前查询的连接，请先在编辑器里选中要诊断的 SQL",
+    failed: "诊断失败，请查看诊断面板中的错误信息",
     originalSql: "原始 SQL",
     coldCache: "冷缓存",
     warmCache: "热缓存（未清空）",

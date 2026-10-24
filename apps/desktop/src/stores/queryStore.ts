@@ -10020,7 +10020,9 @@ export const useQueryStore = defineStore("query", () => {
 
       const built = await buildExplainSql(databaseType, sql, "json", true);
       if (!built.ok) return { error: built.reason, coldStart };
-      const result = await api.executeQuery(tab.connectionId, tab.database, built.sql, schema, executionId, {
+      // 诊断需要 BUFFERS 才能区分冷/热缓存；共享的 buildExplainSql 不带该选项。
+      const explainSql = `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql.trim().replace(/;+\s*$/, "")}`;
+      const result = await api.executeQuery(tab.connectionId, tab.database, explainSql, schema, executionId, {
         clientSessionId,
         catalog: tab.catalog,
         timeoutSecs: queryTimeoutSecs,

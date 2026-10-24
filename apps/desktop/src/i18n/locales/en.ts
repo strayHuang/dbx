@@ -3777,6 +3777,8 @@ export default {
     empty: "Clear caches, execute the query, and compare plan-driven rewrite candidates",
     unsupported: "Performance diagnostics currently supports SQL Server and PostgreSQL only",
     noPlan: "No execution plan was returned",
+    noContext: "Could not resolve the connection for this query. Select the SQL to diagnose in the editor first.",
+    failed: "Diagnostics failed. Check the error shown in the diagnostics panel.",
     originalSql: "Original SQL",
     coldCache: "Cold cache",
     warmCache: "Warm cache (not cleared)",
