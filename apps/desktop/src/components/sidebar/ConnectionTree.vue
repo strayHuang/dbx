@@ -349,7 +349,7 @@ watch([deferredSearchQuery, regexMode], ([newQuery, isRegexMode], [oldQuery, was
     sidebarSearchLoadingTracker.cancel();
     isSidebarSearchLoading.value = false;
   }
-  const searchWork = newQuery ? loadSidebarSearchTargets(newQuery, preservesSearchSubtree) : runSidebarSearchTasks(restoreTasks);
+  const searchWork = newQuery ? Promise.all([loadSidebarSearchTargets(newQuery, preservesSearchSubtree), loadRegexTableSearchIndexes()]) : runSidebarSearchTasks(restoreTasks);
   void searchWork
     .then(() => {
       if (!newQuery && oldQuery) refreshActiveSidebarTableSearches();
@@ -723,23 +723,27 @@ const pendingInvalidatedTableSearchScopes = new Map<string, InvalidatedTableSear
 const regexTableSearchScopes = shallowRef<SidebarRegexIndexScope[]>([]);
 
 async function loadRegexTableSearchIndexes() {
-  if (!regexMode.value || !deferredSearchQuery.value) return;
+  if (!deferredSearchQuery.value) return;
+  const querySnapshot = deferredSearchQuery.value;
+  const regexSnapshot = regexMode.value;
   const loadedScopes = await collectSidebarRegexIndexScopes(
     {
       loadSidebarTableSearchIndexScopes: () => store.loadSidebarTableSearchIndexScopes(),
       loadSidebarTableSearchIndex: (parent) => store.loadSidebarTableSearchIndex(parent.parentNodeId, parent),
     },
     store.treeNodes,
-    () => !regexMode.value || deferredSearchQuery.value === "",
+    () => deferredSearchQuery.value !== querySnapshot || regexMode.value !== regexSnapshot,
   );
-  if (regexMode.value) {
+  // 普通搜索同样使用持久化表索引做投影，这样未展开/未加载的表也能按表名或
+  // 表备注命中，而不只限于树里已经加载的节点。
+  if (deferredSearchQuery.value === querySnapshot && regexMode.value === regexSnapshot) {
     regexTableSearchScopes.value = loadedScopes;
   }
 }
 
 function filterGloballyIndexedRegexTables(nodes: TreeNode[]): TreeNode[] {
-  if (!regexMode.value || !deferredSearchQuery.value) return nodes;
-  const matcher = createSidebarLabelMatcher(deferredSearchQuery.value, { regexMode: true });
+  if (!deferredSearchQuery.value) return nodes;
+  const matcher = createSidebarLabelMatcher(deferredSearchQuery.value, { regexMode: regexMode.value });
   const matchingScopes = regexTableSearchScopes.value.map((scope) => ({ ...scope, entries: scope.entries.filter((entry) => !!matcher(entry.name) || !!matcher(entry.comment || "")) })).filter((scope) => scope.entries.length > 0);
   return mergeSidebarRegexIndexScopes(nodes, matchingScopes);
 }
