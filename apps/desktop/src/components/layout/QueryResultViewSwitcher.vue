@@ -6,8 +6,8 @@ import { Button } from "@/components/ui/button";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import type { RedisResultViewMode } from "@/types/database";
 
-type OutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile";
-type PrimaryResultView = Exclude<OutputView, "explain" | "profile">;
+type OutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile" | "diagnostics";
+type PrimaryResultView = Exclude<OutputView, "explain" | "profile" | "diagnostics">;
 
 const props = withDefaults(
   defineProps<{

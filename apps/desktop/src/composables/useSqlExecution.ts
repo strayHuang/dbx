@@ -166,7 +166,7 @@ export function useSqlExecution(deps: {
   activeConnection: ComputedRef<ConnectionConfig | undefined>;
   executableSql: ComputedRef<string>;
   resolveExecutableSql?: (snapshot?: SqlExecutionSnapshot, tab?: QueryTab) => Promise<string>;
-  activeOutputView: Ref<"result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile">;
+  activeOutputView: Ref<"result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile" | "diagnostics">;
   blockDangerousRedisCommands?: Ref<boolean>;
   onMissingDatabase?: (tabId?: string) => void;
   requestDangerConfirmation?: (request: SqlExecutionDangerRequest) => Promise<boolean>;
@@ -973,6 +973,47 @@ export function useSqlExecution(deps: {
     await runExplain(sql, context);
   }
 
+  /**
+   * 慢查询诊断：清缓存后实际执行并分析计划，同时测量规则生成的改写候选，
+   * 结果写入 tab.diagnosis。仅支持 SQL Server 与 PostgreSQL。
+   */
+  async function runDiagnose(sql: string, context: SqlExecutionContext) {
+    const tab = resolveExecutionTab(context.tabId);
+    if (!tab || !sql.trim()) {
+      toast(t("explain.emptySql"));
+      return;
+    }
+    const databaseType = effectiveDatabaseTypeForConnection(context.connection) ?? context.connection?.db_type;
+    if (databaseType !== "sqlserver" && databaseType !== "postgres") {
+      toast(t("diagnostics.unsupported"), 5000);
+      return;
+    }
+    if (deps.activeTab.value?.id === tab.id) {
+      deps.activeOutputView.value = "diagnostics";
+    }
+    const result = await queryStore.diagnoseTabSql(tab.id, sql, databaseType);
+    if (!result.ok) {
+      const current = resolveExecutionTab(context.tabId);
+      if (current?.diagnosisError) toast(current.diagnosisError, 5000);
+    }
+  }
+
+  async function tryDiagnose(sqlOverride?: SqlExecutionOverride, options: SqlExecutionOptions = {}) {
+    const sourceTab = resolveExecutionTab(options.tabId);
+    if (sourceTab && isObjectDependencySection(sourceTab)) return;
+    const context = captureExecutionContext(options.tabId);
+    if (!context) return;
+    const { sql, sourceOffset } = await resolvedExecutableSql(sqlOverride, context);
+    if (!sql.trim()) {
+      toast(t("explain.emptySql"));
+      return;
+    }
+    if (supportsSqlTemplateParameters(context.connection, sql) && prepareSqlParameterDialog(sql, sourceOffset, { tabId: context.tabId }, (resolvedSql) => runDiagnose(resolvedSql, context))) {
+      return;
+    }
+    await runDiagnose(sql, context);
+  }
+
   async function onDangerConfirm() {
     const sql = pendingDangerSql.value;
     const sourceOffset = pendingDangerSourceOffset.value;
@@ -1089,6 +1130,7 @@ export function useSqlExecution(deps: {
     cancelActiveExecution,
     requestDangerConfirmation,
     tryExplain,
+    tryDiagnose,
     onDangerConfirm,
     showSqlParameterDialog,
     sqlParameterSourceSql,

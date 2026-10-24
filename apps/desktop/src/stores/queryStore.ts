@@ -34,6 +34,7 @@ import { orderPinnedFirst } from "@/lib/app/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
 import { isSqlErrorPositionDebugEnabled, logSqlErrorPosition, sqlErrorHasMessagePosition, sqlErrorMessageText } from "@/lib/sql/errorPosition";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, parseDb2ExplainText, sqlServerExplainResult, type BuildExplainSqlResult, type ExplainPlanDatabaseType } from "@/lib/diagram/explainPlan";
+import { buildCacheClearPlan, diagnoseQueryPlan, extractReferencedRelations, rankMeasuredCandidates, type MeasuredCandidate, type QueryDiagnosis } from "@/lib/diagnostics/queryDiagnostics";
 import { mysqlExplainCompatibilityHint } from "@/lib/diagram/mysqlExplainCompatibility";
 import {
   allEditableColumnsWriteable,
@@ -187,7 +188,7 @@ const UPPERCASE_FOLDED_METADATA_TYPES = new Set<string>([...ORACLE_LIKE_METADATA
 // even though the table has one).
 const HIDDEN_QUERY_KEY_DATABASE_TYPES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "oracle", "xugu", "dameng", "highgo", "oceanbase-oracle", "db2"]);
 const QUERY_RESULT_EXPORT_UNSUPPORTED_ERROR = "Streaming export is unsupported for this query. Simplify it or use a supported driver.";
-const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
+const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export", "diagnostics"] as const;
 const CANCEL_QUERY_TIMEOUT_MS = 10_000;
 const CANCEL_ACK_SETTLE_TIMEOUT_MS = 2_000;
 const QUERY_METADATA_PREFLIGHT_BUDGET_MS = 1_000;
@@ -9891,6 +9892,157 @@ export const useQueryStore = defineStore("query", () => {
     return { ok: true as const, sql: built.sql };
   }
 
+  /**
+   * 慢查询诊断：先清缓存（SQL Server 用 DBCC；PostgreSQL 用 pg_buffercache_evict_relation），
+   * 再实际执行并解析计划，随后对规则生成的候选改写逐个做同样的冷启动测量，最后给出推荐 SQL。
+   * 仅支持 SQL Server 与 PostgreSQL。
+   */
+  async function diagnoseTabSql(id: string, sql: string, databaseType?: DatabaseType) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab) return { ok: false as const, reason: "empty" as const };
+    if (!sql.trim()) return { ok: false as const, reason: "empty" as const };
+    if (databaseType !== "sqlserver" && databaseType !== "postgres") {
+      tab.diagnosisError = t("diagnostics.unsupported");
+      return { ok: false as const, reason: "unsupported" as const };
+    }
+
+    const conn = useConnectionStore().getConfig(tab.connectionId);
+    const queryTimeoutSecs = queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs);
+    const relations = extractReferencedRelations(sql);
+    const cachePlan = buildCacheClearPlan(databaseType, relations);
+
+    tab.isDiagnosing = true;
+    tab.diagnosis = undefined;
+    tab.diagnosisError = undefined;
+
+    try {
+      const baseline = await runDiagnosedPlan(tab, sql, databaseType, cachePlan.statements, queryTimeoutSecs);
+      if (!baseline.plan) {
+        tab.diagnosisError = baseline.error || t("diagnostics.noPlan");
+        return { ok: false as const, reason: "error" as const };
+      }
+
+      const baseDiagnosis = diagnoseQueryPlan(baseline.plan, sql);
+      const measured: MeasuredCandidate[] = [
+        {
+          candidate: { id: "original", title: t("diagnostics.originalSql"), reason: "", sql },
+          ...baseDiagnosis.metrics,
+        },
+      ];
+
+      // 只读候选才会被执行；执行顺序保持串行，避免同时抢占元数据/查询连接。
+      for (const candidate of baseDiagnosis.rewriteCandidates.slice(0, 2)) {
+        const run = await runDiagnosedPlan(tab, candidate.sql, databaseType, cachePlan.statements, queryTimeoutSecs);
+        if (!run.plan) continue;
+        measured.push({ candidate, ...diagnoseQueryPlan(run.plan, candidate.sql).metrics });
+      }
+
+      const ranked = rankMeasuredCandidates(measured, databaseType);
+      const best = ranked[0];
+      const diagnosis: QueryDiagnosis = {
+        ...baseDiagnosis,
+        coldStart: baseline.coldStart,
+        cacheNote: cachePlan.note,
+        measured,
+        recommended: best ? { id: best.candidate.id, title: best.candidate.title, sql: best.candidate.sql, elapsedMs: best.elapsedMs ?? best.executionTimeMs } : undefined,
+      };
+      tab.diagnosis = diagnosis;
+      return { ok: true as const };
+    } catch (error: any) {
+      tab.diagnosisError = String(error?.message || error);
+      return { ok: false as const, reason: "error" as const };
+    } finally {
+      const current = tabs.value.find((t) => t.id === id);
+      if (current) current.isDiagnosing = false;
+    }
+  }
+
+  interface DiagnosedPlanRun {
+    plan?: import("@/lib/diagram/explainPlan").ParsedExplainPlan;
+    error?: string;
+    coldStart: boolean;
+  }
+
+  async function runDiagnosedPlan(tab: QueryTab, sql: string, databaseType: DatabaseType, cacheStatements: readonly string[], queryTimeoutSecs: number): Promise<DiagnosedPlanRun> {
+    const executionId = uuid();
+    const clientSessionId = `${tabClientSessionId(tab, "diagnostics")}:${executionId}`;
+    const schema = queryExecutionSchemaForTab(tab);
+    let coldStart = false;
+
+    if (cacheStatements.length > 0) {
+      if (databaseType === "postgres") {
+        // pg_buffercache_evict_relation 需要扩展；没有权限时忽略创建失败，
+        // 后面的 evict 语句会自行失败并降级为热缓存标注。
+        try {
+          await api.executeQuery(tab.connectionId, tab.database, "CREATE EXTENSION IF NOT EXISTS pg_buffercache;", schema, executionId, {
+            clientSessionId,
+            catalog: tab.catalog,
+            timeoutSecs: Math.min(queryTimeoutSecs || 10, 10),
+            executionMode: "simple",
+          });
+        } catch (error) {
+          console.debug("[DBX][diagnostics:pg-buffercache-extension]", { tabId: tab.id, error });
+        }
+      }
+      try {
+        await api.executeMulti(tab.connectionId, tab.database, cacheStatements.join("\n"), schema, executionId, {
+          clientSessionId,
+          catalog: tab.catalog,
+          timeoutSecs: queryTimeoutSecs,
+          executionMode: "simple",
+        });
+        coldStart = true;
+      } catch (error) {
+        // 无权限或扩展缺失时降级为热缓存运行，并在结果里标注。
+        console.warn("[DBX][diagnostics:cache-clear:error]", { tabId: tab.id, error });
+      }
+    }
+
+    try {
+      if (databaseType === "sqlserver") {
+        const built = await buildExplainSql(databaseType, sql, "json", true);
+        if (!built.ok) return { error: built.reason, coldStart };
+        await api.executeQuery(tab.connectionId, tab.database, "SET STATISTICS XML ON;", schema, executionId, {
+          clientSessionId,
+          timeoutSecs: queryTimeoutSecs,
+          executionMode: "simple",
+        });
+        const results = await api.executeMulti(tab.connectionId, tab.database, sql, schema, executionId, {
+          clientSessionId,
+          timeoutSecs: queryTimeoutSecs,
+          executionMode: "simple",
+        });
+        const outcome = sqlServerExplainResult(results);
+        if (outcome.error !== undefined) return { error: outcome.error, coldStart };
+        if (!outcome.result) return { error: t("explain.empty"), coldStart };
+        return { plan: parseExplainResult("sqlserver", outcome.result), coldStart };
+      }
+
+      const built = await buildExplainSql(databaseType, sql, "json", true);
+      if (!built.ok) return { error: built.reason, coldStart };
+      const result = await api.executeQuery(tab.connectionId, tab.database, built.sql, schema, executionId, {
+        clientSessionId,
+        catalog: tab.catalog,
+        timeoutSecs: queryTimeoutSecs,
+        executionMode: "simple",
+      });
+      return { plan: parseExplainResult("postgres", result), coldStart };
+    } finally {
+      if (databaseType === "sqlserver") {
+        try {
+          await api.executeQuery(tab.connectionId, tab.database, "SET STATISTICS XML OFF;", schema, undefined, {
+            clientSessionId,
+            timeoutSecs: queryTimeoutSecs > 0 ? Math.min(queryTimeoutSecs, 5) : 5,
+            executionMode: "simple",
+          });
+        } catch (error) {
+          console.warn("[DBX][diagnostics:sqlserver-plan-off:error]", { tabId: tab.id, error });
+        }
+      }
+      await closeClientSessionId(tab.connectionId, tab.database, clientSessionId, tab.catalog, { tabId: tab.id }).catch(() => undefined);
+    }
+  }
+
   async function cancelTabExecution(id: string) {
     const tab = findExecutionTab(id);
     if (!tab || !canCancelQueryExecution(tab)) return false;
@@ -11004,6 +11156,7 @@ export const useQueryStore = defineStore("query", () => {
     cancelMultiDbExecutionScope,
     sortTabResultLocally,
     explainTabSql,
+    diagnoseTabSql,
     cancelTabExecution,
     cancelTabExplain,
     reloadEvictedTab,

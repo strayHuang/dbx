@@ -155,6 +155,7 @@ const DamengRoleAdmin = defineAsyncComponent(() => import("@/components/admin/Da
 const SolrAdmin = defineAsyncComponent(() => import("@/components/solr/SolrAdmin.vue"));
 const PluginFilesystemTab = defineAsyncComponent(() => import("@/components/plugins/PluginFilesystemTab.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
+const QueryDiagnosticsPanel = defineAsyncComponent(() => import("@/components/diagnostics/QueryDiagnosticsPanel.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
 const GraphResultView = defineAsyncComponent(() => import("@/components/graph/GraphResultView.vue"));
 import { useQueryStore } from "@/stores/queryStore";
@@ -831,6 +832,8 @@ const canShowResultOutput = computed(() => hasTabularResult.value || props.activ
 const activeGraphAdapter = computed(() => graphAdapterForDatabase(activeEffectiveDatabaseType.value));
 const canShowGraphOutput = computed(() => !!activeGraphAdapter.value && !!props.activeTab.result?.graph_data?.nodes.length);
 const canShowExplainOutput = computed(() => !!props.activeTab.explainPlan || !!props.activeTab.explainError || !!props.activeTab.explainTableResult || !!props.activeTab.explainTableError || props.activeTab.isExplaining === true);
+// 慢查询诊断只在 SQL Server / PostgreSQL 可用；诊断会实际执行查询，执行中禁用。
+const canShowDiagnosticsOutput = computed(() => (activeEffectiveDatabaseType.value === "sqlserver" || activeEffectiveDatabaseType.value === "postgres") && !props.activeTab.isExecuting && !props.activeTab.isDiagnosing);
 // A batch can attach server messages to more than one statement result (for
 // example a `DO $$ RAISE NOTICE $$` block followed by a SELECT). The messages
 // view is scoped to the whole run, so collect every result's messages instead
@@ -2604,12 +2607,14 @@ defineExpose({
                 class="ml-auto"
                 :active-view="activeOutputView"
                 :can-show-explain="canShowExplainOutput"
+                :can-show-diagnostics="canShowDiagnosticsOutput"
                 :can-show-profile="canShowProfile"
                 :can-export-archive="canExportResultArchive"
                 :archive-exporting="resultArchiveExporting"
                 :compact="standaloneResultToolbarCompact"
                 :has-result="!!activeTab.result"
                 @select-explain="selectOutputView(activeTab.id, 'explain')"
+                @select-diagnostics="emit('diagnose', activeTab.id)"
                 @select-profile="selectOutputView(activeTab.id, 'profile')"
                 @export-archive="exportResultArchive"
                 @open-result-view="openPluginResultView"
@@ -2633,6 +2638,8 @@ defineExpose({
               :table-error="activeTab.explainTableError"
               :default-view="settingsStore.editorSettings.defaultExplainView"
             />
+
+            <QueryDiagnosticsPanel v-else-if="activeOutputView === 'diagnostics'" class="flex-1 min-h-0" :diagnosis="activeTab.diagnosis" :error="activeTab.diagnosisError" :loading="activeTab.isDiagnosing" :can-diagnose="canShowDiagnosticsOutput" @diagnose="emit('diagnose', activeTab.id)" />
 
             <ElasticsearchProfilePanel v-else-if="activeOutputView === 'profile' && canShowProfile" class="flex-1 min-h-0" :body="activeElasticsearchProfileBody ?? ''" />
 

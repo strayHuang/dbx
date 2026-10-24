@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onScopeDispose, ref } from "vue";
-import { GitBranch, Gauge, Loader2, PlugZap, Upload } from "@lucide/vue";
+import { Activity, GitBranch, Gauge, Loader2, PlugZap, Upload } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
@@ -8,12 +8,13 @@ import * as api from "@/lib/backend/api";
 import { createFrontendPluginRegistry, type PluginContributionEntry } from "@/lib/plugins/frontendPlugin";
 import type { InstalledPlugin, PluginResultViewContribution } from "@/types/database";
 
-type OutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile";
+type OutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile" | "diagnostics";
 
 const props = withDefaults(
   defineProps<{
     activeView: OutputView;
     canShowExplain: boolean;
+    canShowDiagnostics?: boolean;
     canShowProfile: boolean;
     canExportArchive: boolean;
     archiveExporting: boolean;
@@ -25,6 +26,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   selectExplain: [];
+  selectDiagnostics: [];
   selectProfile: [];
   exportArchive: [];
   openResultView: [pluginId: string, contributionId: string, label: string];
@@ -69,6 +71,23 @@ void refreshInstalledPlugins();
       >
         <GitBranch class="block h-3.5 w-3.5 self-center" />
         <span v-if="!compact" class="inline-flex h-4 items-center leading-none">{{ t("explain.title") }}</span>
+      </Button>
+    </LightTooltip>
+
+    <LightTooltip :text="t('diagnostics.button')" :disabled="!compact" side="bottom" :delay="0" :close-delay="0" nowrap>
+      <Button
+        size="sm"
+        :variant="activeView === 'diagnostics' ? 'secondary' : 'ghost'"
+        class="h-5 shrink-0 text-xs leading-none"
+        :class="compact ? 'w-6 gap-0 px-0' : 'gap-1 px-2'"
+        :title="t('diagnostics.button')"
+        :aria-label="t('diagnostics.button')"
+        :aria-pressed="activeView === 'diagnostics'"
+        :disabled="!canShowDiagnostics"
+        @click="emit('selectDiagnostics')"
+      >
+        <Activity class="block h-3.5 w-3.5 self-center" />
+        <span v-if="!compact" class="inline-flex h-4 items-center leading-none">{{ t("diagnostics.button") }}</span>
       </Button>
     </LightTooltip>
 

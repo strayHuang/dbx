@@ -92,6 +92,7 @@ export interface ContentAreaSurfaceEmits {
   saveSql: [tabId: string];
   cancel: [tabId: string];
   explain: [tabId: string];
+  diagnose: [tabId: string];
   editorUpdate: [tabId: string, value: string];
   editorSelectionChange: [tabId: string, value: string];
   editorCursorChange: [tabId: string, pos: number];

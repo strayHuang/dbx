@@ -29,6 +29,7 @@ export const contentSurfaceEventNames = [
   "paginate",
   "sort",
   "executeSql",
+  "diagnose",
   "clickTable",
   "viewTableData",
   "viewTableDdl",

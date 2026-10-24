@@ -1058,6 +1058,7 @@ const {
   cancelActiveExecution,
   requestDangerConfirmation,
   tryExplain,
+  tryDiagnose,
   onDangerConfirm,
   showSqlParameterDialog,
   sqlParameterSourceSql,
@@ -5476,6 +5477,7 @@ onUnmounted(() => {
                     @execute-in-new-result-tab="(tabId: string, override?: SqlExecutionOverride) => tryExecuteInNewResultTab(override, { tabId })"
                     @cancel="(tabId: string) => cancelActiveExecution(tabId)"
                     @explain="(tabId: string) => tryExplain(undefined, { tabId })"
+                    @diagnose="(tabId: string) => tryDiagnose(undefined, { tabId })"
                     @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v)"
                     @editor-selection-change="
                       (tabId: string, v: string) => {

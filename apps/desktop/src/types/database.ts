@@ -2086,7 +2086,7 @@ export interface QueryPageJumpProgress {
   targetPage: number;
 }
 
-export type TabOutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile";
+export type TabOutputView = "result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile" | "diagnostics";
 
 export type RedisResultViewMode = "grid" | "console";
 
@@ -2261,6 +2261,10 @@ export interface QueryTab {
   explainSql?: string;
   explainTableSql?: string;
   lastExplainedSql?: string;
+  /** Rule-based slow-query diagnosis produced from the actual execution plan. */
+  diagnosis?: import("@/lib/diagnostics/queryDiagnostics").QueryDiagnosis;
+  diagnosisError?: string;
+  isDiagnosing?: boolean;
   isExecuting: boolean;
   redisMonitorActive?: boolean;
   isCancelling?: boolean;
