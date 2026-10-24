@@ -1164,6 +1164,7 @@ provide(EDITOR_TOOLBAR_ACTIONS, {
   toolbarExecuteInNewResultTab: requestActiveEditorExecuteInNewResultTab,
   cancelExecution: (tabId: string) => cancelActiveExecution(tabId),
   explain: (tabId: string) => tryExplain(undefined, { tabId }),
+  diagnose: (tabId: string) => tryDiagnose(undefined, { tabId }),
   formatSql: formatActiveSql,
   compressSql: compressActiveSql,
   toggleSqlKeywordCase,

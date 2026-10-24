@@ -246,6 +246,7 @@ const groupExecutableSql = computed(() => {
         @preview-changes="activeTab && toolbar.previewChanges(activeTab.id)"
         @cancel="activeTab && toolbar.cancelExecution(activeTab.id)"
         @explain="activeTab && toolbar.explain(activeTab.id)"
+        @diagnose="activeTab && toolbar.diagnose(activeTab.id)"
         @format-sql="activeTab && toolbar.formatSql(activeTab.id)"
         @compress-sql="activeTab && toolbar.compressSql(activeTab.id)"
         @fold-all="activeSurfaceRef?.foldAll?.()"

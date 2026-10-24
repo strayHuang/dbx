@@ -31,6 +31,7 @@ import {
   WrapText,
   RefreshCw,
   UserRound,
+  Activity,
 } from "@lucide/vue";
 import { supportsInsertValueHints } from "@/lib/editor/codemirrorInsertValueHints";
 import { Button } from "@/components/ui/button";
@@ -99,6 +100,7 @@ const emit = defineEmits<{
   cancel: [];
   previewChanges: [];
   explain: [];
+  diagnose: [];
   "update:explainMode": [mode: "explain" | "autotrace"];
   formatSql: [];
   compressSql: [];
@@ -282,6 +284,8 @@ watch(
   },
   { immediate: true },
 );
+const supportsDiagnostics = computed(() => props.activeConnection?.db_type === "sqlserver" || props.activeConnection?.db_type === "postgres");
+
 const supportsExplain = computed(() => {
   const dbType = props.activeConnection?.db_type;
   return (
@@ -627,6 +631,21 @@ defineExpose({
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ activeTab.isExplaining ? t("toolbar.stopExplain") : explainPlanTooltip }}</TooltipContent>
+      </Tooltip>
+      <Tooltip v-if="supportsDiagnostics">
+        <TooltipTrigger as-child>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-6 w-6 text-sky-600 hover:bg-sky-500/10 hover:text-sky-700 dark:text-sky-300 dark:hover:text-sky-200"
+            :disabled="activeTab.isExecuting || activeTab.isDiagnosing || !executableSql.trim()"
+            :aria-label="t('diagnostics.button')"
+            @click="emit('diagnose')"
+          >
+            <Activity class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("diagnostics.button") }}</TooltipContent>
       </Tooltip>
       <!-- Autotrace (DM) / EXPLAIN ANALYZE (Postgres) / actual plan (SQL Server) toggle -->
       <Tooltip v-if="showExplainAnalyzeToggle">

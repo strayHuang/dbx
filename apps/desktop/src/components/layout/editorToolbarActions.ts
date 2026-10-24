@@ -33,6 +33,8 @@ export interface EditorToolbarActions {
   toolbarExecuteInNewResultTab(source: "pointer" | "keyboard", tabId: string): void;
   cancelExecution(tabId: string): void;
   explain(tabId: string): void;
+  /** 冷缓存执行 + 计划分析，写入诊断面板。仅 SQL Server / PostgreSQL。 */
+  diagnose(tabId: string): void;
   formatSql(tabId: string): void;
   compressSql(tabId: string): void;
   /** Flips the keyword-case preference and re-cases the acting tab's editor to match. */
@@ -85,6 +87,7 @@ export function createNoopEditorToolbarActions(): EditorToolbarActions {
     toolbarExecuteInNewResultTab: noop,
     cancelExecution: noop,
     explain: noop,
+    diagnose: noop,
     formatSql: noop,
     compressSql: noop,
     toggleSqlKeywordCase: noop,
