@@ -19,11 +19,26 @@ DBX changes only SQL Server column-data decoding:
   that prevents truncating a trailing byte and desynchronizing the TDS stream.
 - Metadata, environment tokens, and other protocol strings retain upstream's
   strict behavior.
+- `sql_variant` (SSVARIANT, 0x62) columns decode instead of aborting the
+  process. The 4-byte value length, properties, and base type are parsed and
+  the payload becomes the matching `ColumnData` variant (integers, bit, money,
+  floats, guid, decimal/numeric, char/varchar/nvarchar, binary, and TDS 7.3
+  date/time types). Unknown base types fall back to the raw payload bytes as
+  binary. This path is only reached for result sets that bypass DBX's
+  `sql_variant`→`nvarchar` rewrite (simple-query batches used by plan and
+  statistics diagnostics); upstream's `todo!()` there panicked and, under
+  `panic = "abort"`, killed the app.
+- CLR user-defined types (UDT, 0xF0) metadata is parsed (max length plus the
+  database, schema, type, and assembly names) and values decode as binary, so
+  spatial columns no longer hit `todo!()` on the same paths.
+- Remaining unimplemented decoders now return protocol/encoding errors instead
+  of panicking (`VarLenType` fallbacks, `intn` invalid lengths).
 
 The regression tests in `src/tds/codec/column_data.rs` exercise the decoder
-with raw TDS value frames. The upstream integration fixtures are omitted from
-this minimal vendor copy because the crates.io manifest does not include their
-repository-only `runtimes-macro` dependency; library unit tests remain enabled.
-Upstream tracks the same failure in
+with raw TDS value frames. The `sql_variant` decoder has its own tests in
+`src/tds/codec/column_data/sql_variant.rs`. The upstream integration fixtures
+are omitted from this minimal vendor copy because the crates.io manifest does
+not include their repository-only `runtimes-macro` dependency; library unit
+tests remain enabled. Upstream tracks the same failure in
 <https://github.com/prisma/tiberius/issues/325>. Remove this patch after an
 equivalent fix is released upstream.

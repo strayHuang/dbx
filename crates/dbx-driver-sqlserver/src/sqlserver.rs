@@ -694,6 +694,8 @@ fn sqlserver_column_type_name(column: &tiberius::Column) -> String {
         ColumnType::BigChar => "char".to_string(),
         ColumnType::BigVarBin => "varbinary".to_string(),
         ColumnType::BigBinary => "binary".to_string(),
+        ColumnType::SSVariant => "sql_variant".to_string(),
+        ColumnType::Udt => "udt".to_string(),
         column_type => format!("{column_type:?}").to_lowercase(),
     }
 }
@@ -4787,6 +4789,8 @@ mod tests {
             (ColumnType::BigChar, "char"),
             (ColumnType::BigVarBin, "varbinary"),
             (ColumnType::BigBinary, "binary"),
+            (ColumnType::SSVariant, "sql_variant"),
+            (ColumnType::Udt, "udt"),
         ] {
             let column = Column::new("value".to_string(), column_type);
             assert_eq!(super::sqlserver_column_type_name(&column), expected);

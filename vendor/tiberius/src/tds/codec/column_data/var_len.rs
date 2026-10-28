@@ -41,7 +41,13 @@ where
         Text => super::text::decode(src, collation).await?,
         NText => super::text::decode(src, None).await?,
         Image => super::image::decode(src).await?,
-        t => unimplemented!("{:?}", t),
+        SSVariant => super::sql_variant::decode(src).await?,
+        Udt => super::binary::decode(src, len).await?,
+        t => {
+            return Err(crate::Error::Protocol(
+                format!("unsupported column data type: {:?}", t).into(),
+            ))
+        }
     };
 
     Ok(res)

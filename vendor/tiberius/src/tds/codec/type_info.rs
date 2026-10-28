@@ -99,7 +99,14 @@ impl Encode<BytesMut> for VarLenContext {
                 dst.put_u32_le(self.len() as u32);
             }
             VarLenType::Xml => (),
-            typ => todo!("encoding {:?} is not supported yet", typ),
+            VarLenType::SSVariant => {
+                dst.put_u32_le(self.len() as u32);
+            }
+            typ => {
+                return Err(Error::Encoding(
+                    format!("encoding {:?} is not supported", typ).into(),
+                ))
+            }
         }
 
         if let Some(collation) = self.collation() {
@@ -314,8 +321,23 @@ impl TypeInfo {
                     VarLenType::Image | VarLenType::Text | VarLenType::NText => {
                         src.read_u32_le().await? as usize
                     }
-                    _ => todo!("not yet implemented for {:?}", ty),
+                    VarLenType::SSVariant => src.read_u32_le().await? as usize,
+                    VarLenType::Udt => src.read_u16_le().await? as usize,
+                    _ => {
+                        return Err(Error::Protocol(
+                            format!("unsupported column type: {:?}", ty).into(),
+                        ))
+                    }
                 };
+
+                if ty == VarLenType::Udt {
+                    // UDT columns carry their database, schema, and type names
+                    // followed by the assembly-qualified CLR type name.
+                    src.read_b_varchar().await?;
+                    src.read_b_varchar().await?;
+                    src.read_b_varchar().await?;
+                    src.read_us_varchar().await?;
+                }
 
                 let collation = match ty {
                     VarLenType::NText
