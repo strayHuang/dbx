@@ -378,6 +378,22 @@ export function isCallParen(nodes: AstNode[], index: number, ctx: SqlLayoutConte
   return !(before?.type === "keyword" && OBJECT_NAME_KEYWORD.test(before.text.trim()));
 }
 
+/**
+ * Whether `(` at `index` is the value list of an `IN`/`NOT IN` predicate — the
+ * keyword directly in front of it says so. Such a list is a value enumeration
+ * rather than a nested expression, so when it does not fit the printer fills its
+ * values onto as few lines as fit instead of expanding one value per line.
+ *
+ * `NOT` may sit between the two: the parser either joins it into the same
+ * keyword (`NOT IN`) or leaves the sibling in front of `(` as the bare `IN`.
+ */
+export function isInListParen(nodes: AstNode[], index: number): boolean {
+  const previous = index > 0 ? nodes[index - 1] : undefined;
+  if (previous?.type !== "keyword") return false;
+  const text = previous.text.trim().replace(/\s+/g, " ").toUpperCase();
+  return text === "IN" || text === "NOT IN";
+}
+
 /** `CREATE TABLE` plus the modifiers dialects may put around it. */
 const CREATE_TABLE_HEAD = "CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:GLOBAL\\s+|LOCAL\\s+)?(?:TEMP(?:ORARY)?\\s+)?(?:UNLOGGED\\s+)?TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?";
 

@@ -159,31 +159,18 @@ describe("sql layout", () => {
     expect(await format(sql, { logicalOperatorNewline: "none" })).toBe(lines("SELECT a,", "       b", "FROM t", "WHERE alpha = 1 AND beta = 2 AND gamma = 3 AND delta = 4 AND epsilon = 5 AND zeta = 6 AND eta = 7 AND theta = 8;"));
   });
 
-  it("expands a parenthesized list that does not fit, aligned under its first item", async () => {
+  it("fills an IN list that does not fit onto as few lines as fit, aligned under its first item", async () => {
     const sql = `SELECT * FROM t WHERE id IN (${Array.from({ length: 16 }, (_, index) => 100000 + index).join(", ")});`;
 
-    expect(await format(sql)).toBe(
-      lines(
-        "SELECT *",
-        "FROM t",
-        "WHERE id IN (100000,",
-        "             100001,",
-        "             100002,",
-        "             100003,",
-        "             100004,",
-        "             100005,",
-        "             100006,",
-        "             100007,",
-        "             100008,",
-        "             100009,",
-        "             100010,",
-        "             100011,",
-        "             100012,",
-        "             100013,",
-        "             100014,",
-        "             100015);",
-      ),
-    );
+    expect(await format(sql)).toBe(lines("SELECT *", "FROM t", "WHERE id IN (100000, 100001, 100002, 100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,", "             100013, 100014, 100015);"));
+  });
+
+  it("keeps a NOT IN list that does not fit compact as well", async () => {
+    const sql = `SELECT * FROM t WHERE id NOT IN (${Array.from({ length: 16 }, (_, index) => 100000 + index).join(", ")});`;
+
+    // "WHERE id NOT IN (" is 17 columns, so 13 six-digit values fit per line
+    // before the fill wraps; the closing parenthesis rides on the last line.
+    expect(await format(sql)).toBe(lines("SELECT *", "FROM t", "WHERE id NOT IN (100000, 100001, 100002, 100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,", "                 100013, 100014, 100015);"));
   });
 
   it("keeps a small subquery inline", async () => {

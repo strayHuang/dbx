@@ -8,6 +8,7 @@ import {
   isBodyNode,
   isCallParen,
   isJoinKeyword,
+  isInListParen,
   isLineComment,
   isLogicalOperator,
   isParenthesis,
@@ -216,9 +217,58 @@ function measureParen(writer: Writer, nodes: AstNode[], index: number, ctx: SqlL
 }
 
 /**
+ * Fills an `IN` list's values onto as few lines as fit, each line aligned at the
+ * list's own column, or returns `false` when some value cannot be rendered on a
+ * single line (a subquery, a `--` comment) and the one-value-per-line expansion
+ * must take over.
+ *
+ * `IN (...)` is a value enumeration, not a nested expression: giving each value
+ * a line of its own made a 20-value list sprawl over 20 lines, while every other
+ * element list in the style fills its line before wrapping.
+ */
+function fillInList(writer: Writer, children: AstNode[], width: number, ctx: SqlLayoutContext): boolean {
+  const items = splitByComma(children);
+  if (items.length === 0 || items.some((item) => item.length === 0)) return false;
+  const itemColumn = writer.column;
+  const values: string[] = [];
+  for (const item of items) {
+    const value = renderInline(collapsedContext(ctx), item, width - itemColumn);
+    if (!value) return false;
+    values.push(value);
+  }
+  // The comma placement follows the clause-item rule: trailing commas by
+  // default, leading commas on the continuation lines when the setting asks.
+  const leadingComma = ctx.options.commaPosition === "before";
+  let line: string | null = null;
+  for (const value of values) {
+    if (line === null) {
+      line = value;
+      continue;
+    }
+    const joined = `${line}, ${value}`;
+    if (itemColumn + joined.length <= width) {
+      line = joined;
+      continue;
+    }
+    writer.write(line);
+    if (leadingComma) {
+      writer.newline(Math.max(0, itemColumn - 2));
+      writer.write(", ");
+    } else {
+      writer.write(",");
+      writer.newline(itemColumn);
+    }
+    line = value;
+  }
+  if (line !== null) writer.write(line);
+  return true;
+}
+
+/**
  * Emits a parenthesis group: inline while it fits — together with the rest of
  * the join element it opens — and expanded, re-based on the `(`'s own column,
- * when it does not.
+ * when it does not. An `IN` list that does not fit inline is filled onto as few
+ * lines as fit instead of expanding one value per line.
  */
 function writeParenthesis(writer: Writer, nodes: AstNode[], index: number, ctx: SqlLayoutContext): void {
   const node = nodes[index] as ParenthesisNode;
@@ -228,6 +278,12 @@ function writeParenthesis(writer: Writer, nodes: AstNode[], index: number, ctx: 
     return;
   }
   writer.write(node.openParen);
+  // The closing parenthesis rides on the last filled line, so the fill is
+  // measured against the width left after it.
+  if (isInListParen(nodes, index) && fillInList(writer, node.children, ctx.options.lineWidth - node.closeParen.length, ctx)) {
+    writer.write(node.closeParen);
+    return;
+  }
   printBlock(writer, node.children, writer.column, ctx);
   writer.write(node.closeParen);
 }
