@@ -2040,6 +2040,7 @@ export default withEnglishFallback({
     search: {
       find: "尋找",
       replace: "取代",
+      replacePlaceholder: "取代為（\\n 換行、\\t 定位字元）",
       replaceAll: "全部取代",
       searchFailed: "搜尋失敗或逾時，請簡化運算式後重試。",
       caseSensitive: "區分大小寫",

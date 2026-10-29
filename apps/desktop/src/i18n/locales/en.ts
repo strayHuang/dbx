@@ -2305,6 +2305,7 @@ export default {
     search: {
       find: "Find",
       replace: "Replace",
+      replacePlaceholder: "Replace with (\\n newline, \\t tab)",
       replaceAll: "Replace All",
       searchFailed: "Search failed or timed out. Simplify the expression and try again.",
       caseSensitive: "Case sensitive",

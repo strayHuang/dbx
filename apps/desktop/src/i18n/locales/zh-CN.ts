@@ -2238,6 +2238,7 @@ export default withEnglishFallback({
     search: {
       find: "查找",
       replace: "替换",
+      replacePlaceholder: "替换为（\\n 换行、\\t 制表符）",
       replaceAll: "全部替换",
       searchFailed: "搜索失败或超时，请简化表达式后重试。",
       caseSensitive: "区分大小写",

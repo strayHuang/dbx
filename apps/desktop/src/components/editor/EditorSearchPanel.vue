@@ -3,7 +3,7 @@ import { ref, nextTick, onBeforeUnmount, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { EditorView } from "@codemirror/view";
 import { EditorSelection } from "@codemirror/state";
-import { setSearchQuery, openSearchPanel as cmOpenSearchPanel, findNext as cmFindNext, findPrevious as cmFindPrevious, replaceNext as cmReplaceNext, replaceAll as cmReplaceAll } from "@codemirror/search";
+import { setSearchQuery, openSearchPanel as cmOpenSearchPanel, findNext as cmFindNext, findPrevious as cmFindPrevious } from "@codemirror/search";
 import { ChevronUp, ChevronDown, ChevronRight, TextSelect, X } from "@lucide/vue";
 import { collectEditorSearchMatches, countEditorSearchMatches, createEditorSearchQuery, replaceEditorSearchMatches, type EditorSearchMatch } from "@/lib/editor/editorSearchQuery";
 import { appendSearchMatchSelection, findSearchMatch, isSearchAddSelectionModifier, selectionRangesForSearchMatches, type EditorSearchSelectionDirection } from "@/lib/editor/editorSearchSelection";
@@ -103,22 +103,53 @@ function clearSearchQuery() {
 }
 
 /**
- * Get replacement text for a regex match, supporting capture groups.
+ * Resolve the escape sequences the replace field supports (`\n`, `\r`, `\t`,
+ * `\\`); any other backslash sequence is kept verbatim, so regex users writing
+ * `\d` in the replacement are unaffected. The field is a single-line input, and
+ * CodeMirror's own replace commands insert the raw text as typed — pasted
+ * content such as `<br>` could otherwise never become a real line break.
+ */
+function unescapeReplaceText(raw: string): string {
+  if (!raw.includes("\\")) return raw;
+  return raw.replace(/\\(.)/g, (_, character: string) => {
+    switch (character) {
+      case "n":
+        return "\n";
+      case "r":
+        return "\r";
+      case "t":
+        return "\t";
+      case "\\":
+        return "\\";
+      default:
+        return `\\${character}`;
+    }
+  });
+}
+
+/**
+ * Get replacement text for a match: capture groups in regex mode, and the
+ * escape sequences above in both modes.
  */
 function computeReplacementForMatch(v: EditorView, matchFrom: number, matchTo: number): string {
-  if (!useRegex.value) return replaceText.value;
+  const unescape = (text: string) => unescapeReplaceText(text);
+  if (!useRegex.value) return unescape(replaceText.value);
   const matchedText = v.state.sliceDoc(matchFrom, matchTo);
   try {
     const re = new RegExp(searchText.value, caseSensitive.value ? "" : "i");
     const m = re.exec(matchedText);
-    if (!m) return replaceText.value;
-    return replaceText.value.replace(/\$(\d+|&)/g, (_, ref) => {
-      if (ref === "&") return m[0];
-      const idx = parseInt(ref, 10);
-      return idx < m.length ? (m[idx] ?? "") : `$${ref}`;
-    });
+    if (!m) return unescape(replaceText.value);
+    // `$n` groups are substituted first so that `\n` in the replacement is
+    // still an escape when the substitution result is unescaped below.
+    return unescape(
+      replaceText.value.replace(/\$(\d+|&)/g, (_, ref) => {
+        if (ref === "&") return m[0];
+        const idx = parseInt(ref, 10);
+        return idx < m.length ? (m[idx] ?? "") : `$${ref}`;
+      }),
+    );
   } catch {
-    return replaceText.value;
+    return unescape(replaceText.value);
   }
 }
 
@@ -437,7 +468,19 @@ function doReplace() {
       findInScope("next");
     }
   } else {
-    cmReplaceNext(v);
+    // Full document: find and replace the match at/after the cursor here —
+    // CodeMirror's replaceNext would insert the replace field's raw text,
+    // dropping the escape sequences and capture-group handling above.
+    const sel = v.state.selection.main;
+    const target = findSearchMatch(iterateAllMatches(v), sel.from, "next");
+    if (target) {
+      const insertText = computeReplacementForMatch(v, target.from, target.to);
+      v.dispatch({
+        changes: { from: target.from, to: target.to, insert: insertText },
+        selection: EditorSelection.range(target.from, target.from + insertText.length),
+        scrollIntoView: true,
+      });
+    }
   }
   updateMatchInfo(true);
 }
@@ -452,7 +495,10 @@ function doReplaceAll() {
     if (!matches || matches.length === 0) return;
     replaceEditorSearchMatches(v, matches, (match) => computeReplacementForMatch(v, match.from, match.to));
   } else {
-    cmReplaceAll(v);
+    // Full document: the same single-dispatch replacement as the scoped
+    // branch — CodeMirror's replaceAll would insert the raw replace text.
+    const matches = collectAllMatches(v);
+    if (matches.length > 0) replaceEditorSearchMatches(v, matches, (match) => computeReplacementForMatch(v, match.from, match.to));
   }
   updateMatchInfo();
 }
@@ -567,7 +613,7 @@ defineExpose({
             autocorrect="off"
             spellcheck="false"
             class="h-full min-w-0 flex-1 bg-transparent px-2 text-sm text-foreground outline-none placeholder:text-muted-foreground"
-            :placeholder="t('editor.search.replace')"
+            :placeholder="t('editor.search.replacePlaceholder')"
             @keydown.enter.prevent="doReplace"
             @keydown.escape.prevent="closeSearch"
           />
