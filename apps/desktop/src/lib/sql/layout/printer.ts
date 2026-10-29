@@ -245,7 +245,7 @@ function fillInList(writer: Writer, children: AstNode[], width: number, ctx: Sql
       line = value;
       continue;
     }
-    const joined = `${line}, ${value}`;
+    const joined: string = `${line}, ${value}`;
     if (itemColumn + joined.length <= width) {
       line = joined;
       continue;
