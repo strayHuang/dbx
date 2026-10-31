@@ -234,7 +234,7 @@ function parseSqlServerPlan(raw: unknown, sql?: string): SqlServerPlanFacts {
     // and output columns come from the query text, since the plan only reports
     // the filters it chose to evaluate.
     const hints = scannedTables.slice(0, 3).map((scan) => buildScanIndexHint({ databaseType: "sqlserver", table: scan.display, relation: scan.relation, facts, totalRows: scan.rows }));
-    for (const hint of hints) if (hint.index) indexes.push(hint.index);
+    for (const hint of hints) indexes.push(...hint.indexes);
     findings.push({
       severity: "critical",
       code: "sqlserver.table-scan",
@@ -364,7 +364,7 @@ function walkPostgresNode(node: Record<string, unknown>, ctx: PostgresWalkContex
       detail: `${detailTable} 使用 Seq Scan，实际返回 ${Math.round(actualRows * loops)} 行${rowsRemoved > 0 ? `，过滤掉 ${Math.round(rowsRemoved * loops)} 行` : ""}${filter ? `；Filter: ${filter}` : ""}`,
       suggestion: hint.text,
     });
-    if (hint.index) ctx.indexes.push(hint.index);
+    if (hint.indexes.length > 0) ctx.indexes.push(...hint.indexes);
   }
 
   const sortMethod = node["Sort Method"] ? String(node["Sort Method"]) : undefined;
@@ -567,6 +567,8 @@ interface SqlTableAlias {
   alias: string;
   /** Table name possibly schema-qualified (`public.orders`). */
   table: string;
+  /** Offset of the declaration, used to pair `JOIN` targets with `USING` columns. */
+  index: number;
 }
 
 const RESERVED_ALIAS_WORDS = new Set([
@@ -602,20 +604,67 @@ const RESERVED_ALIAS_WORDS = new Set([
   "from",
 ]);
 
-/** Maps aliases to base tables, ignoring derived tables (`from (select …) t2`). */
+/** Blanks out everything inside parentheses, keeping offsets so regex indices stay valid. */
+function maskParenthesizedContents(sql: string): string {
+  let depth = 0;
+  let masked = "";
+  for (const character of sql) {
+    if (character === "(") {
+      depth += 1;
+      masked += character;
+      continue;
+    }
+    if (character === ")") {
+      depth = Math.max(0, depth - 1);
+      masked += character;
+      continue;
+    }
+    masked += depth > 0 && character !== "\n" ? " " : character;
+  }
+  return masked;
+}
+
+/** Falls back to the bare table name when the alias slot holds a keyword (`on`, `where`). */
+function resolveAlias(candidate: string | undefined, table: string): string {
+  return candidate && !RESERVED_ALIAS_WORDS.has(candidate.toLowerCase()) ? candidate : (table.split(".").pop() ?? table);
+}
+
+/**
+ * Maps aliases to base tables, ignoring derived tables (`from (select …) t2`).
+ *
+ * Covers every `JOIN` flavour (inner/left/right/full/cross, `ON` or `USING`),
+ * plus the legacy comma-separated FROM list — that is an implicit inner join
+ * and is still very common in older SQL Server queries.
+ */
 function extractSqlTableAliases(sql: string): SqlTableAlias[] {
   const aliases: SqlTableAlias[] = [];
   const seen = new Set<string>();
-  const pattern = /\b(?:from|join)\s+(?!\()([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)\s*(?:(?:as)\s+)?([A-Za-z_][\w$]*)?/gi;
-  for (const match of sql.matchAll(pattern)) {
-    const table = match[1];
-    if (!table) continue;
-    const candidate = match[2];
-    const alias = candidate && !RESERVED_ALIAS_WORDS.has(candidate.toLowerCase()) ? candidate : (table.split(".").pop() ?? table);
+  const add = (table: string, candidate: string | undefined, index: number) => {
+    const alias = resolveAlias(candidate, table);
     const key = alias.toLowerCase();
-    if (seen.has(key)) continue;
+    if (seen.has(key)) return;
     seen.add(key);
-    aliases.push({ alias, table });
+    aliases.push({ alias, table, index });
+  };
+
+  const structural = maskParenthesizedContents(sql);
+  for (const match of structural.matchAll(/\b(?:from|join)\s+(?!\()([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)\s*(?:(?:as)\s+)?([A-Za-z_][\w$]*)?/gi)) {
+    if (match[1]) add(match[1], match[2], match.index ?? 0);
+  }
+
+  // `from a x, b y` — one relation per top-level comma. Parenthesized contents
+  // are already blanked, so their commas cannot split anything.
+  const fromClause = /\bfrom\b([^;]*?)(?=\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|\boffset\b|\bunion\b|\bexcept\b|\bintersect\b|\bon\b|;|$)/i.exec(structural);
+  if (fromClause?.[1] !== undefined) {
+    let offset = (fromClause.index ?? 0) + fromClause[0].length - fromClause[1].length;
+    for (const chunk of fromClause[1].split(",")) {
+      const position = offset;
+      offset += chunk.length + 1;
+      const trimmed = chunk.trim();
+      if (!trimmed || trimmed.startsWith("(")) continue;
+      const relation = /^([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)\s*(?:(?:as)\s+)?([A-Za-z_][\w$]*)?/i.exec(trimmed);
+      if (relation?.[1]) add(relation[1], relation[2], position);
+    }
   }
   return aliases;
 }
@@ -785,6 +834,29 @@ export function deriveSqlColumnFacts(sql: string): SqlColumnFacts {
     }
   }
 
+  // `JOIN … USING (a, b)` and `NATURAL JOIN` write no `alias.column` reference, so
+  // the scan above cannot see those join keys. Pair every USING clause with the
+  // join target declared right before it and the relation on the other side.
+  const structural = maskParenthesizedContents(scan);
+  const joinTargets = [...structural.matchAll(/\bjoin\s+(?!\()([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)\s*(?:(?:as)\s+)?([A-Za-z_][\w$]*)?/gi)].map((match) => ({
+    alias: resolveAlias(match[2], match[1]!),
+    index: match.index ?? 0,
+  }));
+  for (const match of scan.matchAll(/\busing\s*\(\s*([^)]*?)\s*\)/gi)) {
+    const start = match.index ?? 0;
+    const target = joinTargets.filter((entry) => entry.index < start).pop();
+    if (!target || !aliasSet.has(target.alias.toLowerCase())) continue;
+    const counterparts = aliases.filter((entry) => entry.index < target.index && entry.alias.toLowerCase() !== target.alias.toLowerCase());
+    const counterpart = counterparts[counterparts.length - 1] ?? aliases.find((entry) => entry.alias.toLowerCase() !== target.alias.toLowerCase());
+    if (!counterpart) continue;
+    for (const raw of match[1]!.split(",")) {
+      const column = raw.trim();
+      if (!/^[A-Za-z_][\w$]*$/.test(column)) continue;
+      addUnique(usageFor(target.alias).join, column);
+      addUnique(usageFor(counterpart.alias).join, column);
+    }
+  }
+
   // SELECT list, GROUP BY and aggregate inputs become INCLUDE candidates.
   const selectBody = /\bselect\b([\s\S]*?)\bfrom\b/i.exec(scan)?.[1] ?? "";
   const groupBody = /\bgroup\s+by\b([\s\S]*?)(?:\b(?:having|order\s+by|limit|offset)\b|$)/i.exec(scan)?.[1] ?? "";
@@ -857,13 +929,71 @@ interface ScanIndexHintInput {
   loops?: number;
 }
 
-type IndexSuggestionVariant = "equality-first" | "range-first" | "scan-hint";
+type IndexSuggestionVariant = "equality-first" | "range-first" | "scan-hint" | "join-first";
 
 const INDEX_VARIANT_REASON: Record<IndexSuggestionVariant, string> = {
   "equality-first": "来自 SQL 谓词与输出列推导（等值列在前、范围列在后，输出列放 INCLUDE）",
   "range-first": "对照方案：范围列在前（部分优化器在范围选择性更高时更优），输出列放 INCLUDE",
-  "scan-hint": "来自执行计划中的顺序扫描：过滤/连接列作键列，其余连接列与输出列放 INCLUDE",
+  "scan-hint": "来自执行计划中的顺序扫描：过滤列作键、连接列紧随其后，其余列放 INCLUDE",
+  "join-first": "连接列作键列：本表被其他表驱动时，嵌套循环可按连接键直接定位行",
 };
+
+interface TableIndexInput {
+  databaseType: string;
+  /** Table as written to the user (`public.qstest_oitm`). */
+  table: string;
+  equality: string[];
+  range: string[];
+  join: string[];
+  output: string[];
+  /** Variant used by the filter-leading suggestion. */
+  variant: IndexSuggestionVariant;
+}
+
+/** `(a, b) INCLUDE (c)` — only the key/INCLUDE part, for prose. */
+function summarizeIndex(suggestion: QueryIndexSuggestion): string {
+  const include = suggestion.includeColumns.length > 0 ? ` INCLUDE (${suggestion.includeColumns.join(", ")})` : "";
+  return `(${suggestion.columns.join(", ")})${include}`;
+}
+
+/**
+ * One table's index options, shared by the plan pass and the SQL-text pass.
+ *
+ * Every join flavour (inner/left/right/full/cross, `ON`/`USING`, comma lists) is
+ * folded into `join`, so a table is always analysed on both fronts: a
+ * filter-leading index for its WHERE predicates *and* join-first indexes that let
+ * the optimizer probe this table from the driving side of the join.
+ */
+function buildTableIndexSuggestions(input: TableIndexInput): QueryIndexSuggestion[] {
+  const equality = uniqueColumns(input.equality);
+  const range = uniqueColumns(input.range);
+  const join = uniqueColumns(input.join);
+  const filters = uniqueColumns([...equality, ...range]);
+  // Every column this table has to supply: filters, join keys and projection.
+  const referenced = uniqueColumns([...filters, ...join, ...input.output]);
+  const suggestions: QueryIndexSuggestion[] = [];
+  const seen = new Set<string>();
+  const push = (columns: string[], variant: IndexSuggestionVariant) => {
+    const keyColumns = uniqueColumns(columns).slice(0, 4);
+    if (keyColumns.length === 0) return;
+    const dedupe = keyColumns.map((column) => column.toLowerCase()).join(",");
+    if (seen.has(dedupe)) return;
+    seen.add(dedupe);
+    const includeColumns = referenced.filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase())).slice(0, 6);
+    suggestions.push(buildIndexSuggestionSql(input.table, keyColumns, includeColumns, input.databaseType, variant));
+  };
+
+  // Filters first and the join keys right behind them: one index serves the
+  // WHERE predicate and the join lookup at the same time.
+  if (filters.length > 0) push([...filters, ...join], input.variant);
+  // Each join key also stands on its own, because the driving side decides which
+  // column the nested loop probes by.
+  for (const column of join.slice(0, 2)) push([column], "join-first");
+  // Keep the range-first comparison plan when there is no join to weigh in.
+  if (join.length === 0 && equality.length > 0 && range.length > 0) push([...range, ...equality], "range-first");
+
+  return suggestions;
+}
 
 /**
  * Turns "this table is scan-only" into the specific index that removes the scan.
@@ -872,37 +1002,39 @@ const INDEX_VARIANT_REASON: Record<IndexSuggestionVariant, string> = {
  * scans that exist purely because of a join key. Join columns and output
  * columns are therefore taken from the query text.
  */
-function buildScanIndexHint(input: ScanIndexHintInput): { text: string; index?: QueryIndexSuggestion } {
+function buildScanIndexHint(input: ScanIndexHintInput): { text: string; indexes: QueryIndexSuggestion[] } {
   const usage = usageForRelation(input.facts, input.relation);
   const planFilters = uniqueColumns(input.filterColumns ?? []);
-  const equality = uniqueColumns(usage?.equality ?? []);
-  const joins = uniqueColumns(usage?.join ?? []);
-  const outputs = uniqueColumns(usage?.output ?? []);
-  const filters = planFilters.length > 0 ? planFilters : equality;
+  const equality = uniqueColumns([...planFilters, ...(usage?.equality ?? [])]);
+  const range = uniqueColumns(usage?.range ?? []);
+  const join = uniqueColumns(usage?.join ?? []);
+  const output = uniqueColumns(usage?.output ?? []);
+  const filters = uniqueColumns([...equality, ...range]);
 
-  const keyColumns = filters.length > 0 ? filters.slice(0, 3) : joins.length > 0 ? [joins[0]!] : [];
   const workers = input.loops && input.loops > 1 ? `（${input.loops} 个并行进程）` : "";
   const scope = `本次扫描约 ${formatCount(input.totalRows)}行${workers}${input.removedRows && input.removedRows >= 1000 ? `（过滤掉 ${formatCount(input.removedRows)}行）` : ""}${input.readBlocks ? `，读取 ${formatCount(input.readBlocks)}个块` : ""}`;
 
-  if (keyColumns.length === 0) {
-    return { text: `未从 SQL 中解析出 ${input.table} 的过滤/连接列，请补全 WHERE/JOIN 谓词后再评估索引；${scope}。` };
+  const indexes = buildTableIndexSuggestions({ databaseType: input.databaseType, table: input.table, equality, range, join, output, variant: "scan-hint" });
+  if (indexes.length === 0) {
+    return { text: `未从 SQL 中解析出 ${input.table} 的过滤/连接列，请补全 WHERE/JOIN 谓词后再评估索引；${scope}。`, indexes };
   }
 
-  const includeColumns = uniqueColumns([...equality, ...joins, ...outputs])
-    .filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase()))
-    .slice(0, 6);
-  const index = buildIndexSuggestionSql(input.table, keyColumns, includeColumns, input.databaseType, "scan-hint");
-  const indexText = `(${keyColumns.join(", ")})${includeColumns.length > 0 ? ` INCLUDE (${includeColumns.join(", ")})` : ""}`;
-
+  const indexText = indexes.map(summarizeIndex).join("、");
+  if (filters.length > 0 && join.length > 0) {
+    return {
+      text: `为 ${input.table} 建立索引 ${indexText}：过滤列作键、连接列紧随其后，一条索引同时服务 WHERE 过滤与 JOIN 定位；连接列单独作键的那条供优化器从驱动侧按连接键探测，避免整表顺序扫描（${scope}）。`,
+      indexes,
+    };
+  }
   if (filters.length > 0) {
     return {
-      text: `为 ${input.table} 建立索引 ${indexText}：过滤列作键列${includeColumns.length > 0 ? "，连接列与输出列放 INCLUDE 后可走 Index Only Scan" : ""}，直接定位命中的行，避免整表顺序扫描（${scope}）。`,
-      index,
+      text: `为 ${input.table} 建立索引 ${indexText}：过滤列作键列${indexes[0]?.includeColumns.length ? "，其余列放 INCLUDE 后可走 Index Only Scan" : ""}，直接定位命中的行，避免整表顺序扫描（${scope}）。`,
+      indexes,
     };
   }
   return {
     text: `${input.table} 的扫描来自连接等值而非自身过滤条件，应在连接列上建索引 ${indexText}：优化器可用嵌套循环 + Index Scan 按连接键逐行取数，避免整表顺序扫描（${scope}）。`,
-    index,
+    indexes,
   };
 }
 
@@ -911,9 +1043,9 @@ function buildScanIndexHint(input: ScanIndexHintInput): { text: string; index?: 
  *
  * Execution plans only expose the predicates the optimizer chose to report
  * (SQL Server MissingIndexes, PostgreSQL per-row Filters), so BETWEEN range
- * joins, IN lists and aggregate inputs are routinely missing. This pass reads
- * WHERE/ON predicates per alias, then adds SELECT/GROUP BY/aggregate columns as
- * INCLUDE columns: equality and join columns first, range columns after them.
+ * joins, IN lists, `USING (…)` keys and aggregate inputs are routinely missing.
+ * This pass reads WHERE/ON/USING per alias and hands each table to the shared
+ * builder, which always covers both its own filters and its join keys.
  */
 export function buildIndexSuggestionsFromSql(sql: string, databaseType: string): QueryIndexSuggestion[] {
   const facts = deriveSqlColumnFacts(sql);
@@ -921,19 +1053,17 @@ export function buildIndexSuggestionsFromSql(sql: string, databaseType: string):
   for (const entry of facts.aliases) {
     const usage = facts.usage.get(entry.alias.toLowerCase());
     if (!usage) continue;
-    const equalityOrJoin = uniqueColumns([...usage.equality, ...usage.join]);
-    const range = uniqueColumns(usage.range);
-    const keyColumns = uniqueColumns([...equalityOrJoin, ...range]).slice(0, 4);
-    if (keyColumns.length === 0) continue;
-    const includeColumns = uniqueColumns(usage.output)
-      .filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase()))
-      .slice(0, 6);
-    suggestions.push(buildIndexSuggestionSql(entry.table, keyColumns, includeColumns, databaseType, "equality-first"));
-    // 等值与范围列都存在时，同时给出范围列在前的对照方案，便于实际执行后对比。
-    if (equalityOrJoin.length > 0 && range.length > 0) {
-      const rangeFirst = uniqueColumns([...range, ...equalityOrJoin]).slice(0, 4);
-      suggestions.push(buildIndexSuggestionSql(entry.table, rangeFirst, includeColumns, databaseType, "range-first"));
-    }
+    suggestions.push(
+      ...buildTableIndexSuggestions({
+        databaseType,
+        table: entry.table,
+        equality: usage.equality,
+        range: usage.range,
+        join: usage.join,
+        output: usage.output,
+        variant: "equality-first",
+      }),
+    );
   }
   return suggestions;
 }
@@ -942,7 +1072,7 @@ function buildIndexSuggestionSql(table: string, columns: string[], includeColumn
   const [schema, name] = table.includes(".") ? (table.split(".") as [string, string]) : [undefined, table];
   const why = reason ?? INDEX_VARIANT_REASON[variant];
   if (databaseType === "sqlserver") {
-    const suffix = variant === "range-first" ? "_R" : "";
+    const suffix = variant === "range-first" ? "_R" : variant === "join-first" ? "_J" : "";
     const indexName = `IX_${name.replace(/[^\w]/g, "")}_${columns.map((column) => column.replace(/[^\w]/g, "")).join("_")}${suffix}`.slice(0, 120);
     const target = `[${schema ?? "dbo"}].[${name}]`;
     const includeClause = includeColumns.length > 0 ? ` INCLUDE (${includeColumns.map((column) => `[${column}]`).join(", ")})` : "";

@@ -214,20 +214,45 @@ group by shpentry`;
     // groupname belongs to qstest_oitg and style to qstest_oitm; neither may leak
     // into the qstest_oitw suggestion.
     const oitw = forTable("qstest_oitw");
-    expect(oitw).toHaveLength(1);
+    expect(oitw).toHaveLength(2);
     expect(oitw[0]!.columns).toEqual(["qty1", "itementry"]);
     expect(oitw[0]!.includeColumns).toEqual([]);
+    // The join key also stands alone so the other table can probe it.
+    expect(oitw[1]!.columns).toEqual(["itementry"]);
+    expect(oitw[1]!.includeColumns).toEqual(["qty1"]);
+    expect(oitw[1]!.reason).toContain("连接列作键列");
 
     const oitm = forTable("qstest_oitm");
-    expect(oitm).toHaveLength(1);
-    expect(oitm[0]!.columns).toEqual(["docentry", "groupcode"]);
-    expect(oitm[0]!.includeColumns).toEqual(["style"]);
+    expect(oitm).toHaveLength(2);
+    expect(oitm[0]!.columns).toEqual(["docentry"]);
+    expect(oitm[0]!.includeColumns).toEqual(["groupcode", "style"]);
+    expect(oitm[1]!.columns).toEqual(["groupcode"]);
+    expect(oitm[1]!.includeColumns).toEqual(["docentry", "style"]);
 
     const oitg = forTable("qstest_oitg");
     expect(oitg).toHaveLength(1);
     expect(oitg[0]!.columns).toEqual(["groupcode"]);
     expect(oitg[0]!.includeColumns).toEqual(["groupname"]);
     expect(oitg[0]!.sql).toContain("CREATE INDEX ON qstest_oitg (groupcode) INCLUDE (groupname);");
+  });
+
+  it("analyses join keys for every join flavour, not just WHERE filters", () => {
+    const joinIndex = (sql: string, table: string, joinColumn: string) => {
+      const suggestions = buildIndexSuggestionsFromSql(sql, "postgres").filter((entry) => entry.table === table);
+      return suggestions.find((entry) => entry.columns[0]?.toLowerCase() === joinColumn && entry.reason.includes("连接列作键列"));
+    };
+
+    expect(joinIndex("select a.name, b.title from qstest_a a inner join qstest_b b on a.id = b.aid where b.total > 10", "qstest_b", "aid")).toBeDefined();
+    expect(joinIndex("select a.name, b.title from qstest_a a left join qstest_b b on a.id = b.aid where b.total > 10", "qstest_b", "aid")).toBeDefined();
+    // Old-style comma join: an implicit inner join, very common in SQL Server code.
+    expect(joinIndex("select a.name, b.title from qstest_a a, qstest_b b where a.id = b.aid and b.total > 10", "qstest_b", "aid")).toBeDefined();
+    // `USING` never writes `alias.column`, so the key has to come from the clause itself.
+    expect(joinIndex("select a.name, b.title from qstest_a a join qstest_b b using (id) where b.total > 10", "qstest_b", "id")).toBeDefined();
+
+    // CROSS JOIN has no ON clause: each side is still analysed on its own filters.
+    const crossed = buildIndexSuggestionsFromSql("select a.name, b.title from qstest_a a cross join qstest_b b where a.id > 0 and b.total > 10", "postgres");
+    expect(crossed.filter((entry) => entry.table === "qstest_a")[0]?.columns).toEqual(["id"]);
+    expect(crossed.filter((entry) => entry.table === "qstest_b")[0]?.columns).toEqual(["total"]);
   });
 
   it("turns seq scans into concrete covering indexes instead of generic advice", () => {
@@ -241,19 +266,27 @@ group by shpentry`;
     expect(oitmFinding.suggestion).toContain("嵌套循环");
 
     const oitwFinding = scanFindings.find((finding) => finding.detail.includes("qstest_oitw"))!;
-    expect(oitwFinding.suggestion).toContain("(qty1) INCLUDE (itementry)");
+    // The filter and the join key share one index; the join key also gets its own.
+    expect(oitwFinding.suggestion).toContain("(qty1, itementry)");
+    expect(oitwFinding.suggestion).toContain("(itementry) INCLUDE (qty1)");
 
     // Plan hints win over the SQL pass when they describe the same column set,
-    // so the two duplicated SQL suggestions are dropped.
-    expect(diagnosis.indexSuggestions).toHaveLength(3);
-    const oitwIndex = diagnosis.indexSuggestions.find((entry) => entry.table === "public.qstest_oitw")!;
-    expect(oitwIndex.columns).toEqual(["qty1"]);
-    expect(oitwIndex.includeColumns).toEqual(["itementry"]);
-    expect(oitwIndex.sql).toContain("(qty1) INCLUDE (itementry)");
-    const oitmIndex = diagnosis.indexSuggestions.find((entry) => entry.table === "public.qstest_oitm")!;
-    expect(oitmIndex.columns).toEqual(["docentry"]);
-    expect(oitmIndex.includeColumns).toEqual(["groupcode", "style"]);
-    const oitgIndex = diagnosis.indexSuggestions.find((entry) => entry.columns[0] === "groupcode")!;
+    // so the duplicated SQL suggestions are dropped: 2 + 2 + 1 = 5.
+    expect(diagnosis.indexSuggestions).toHaveLength(5);
+    const oitwIndexes = diagnosis.indexSuggestions.filter((entry) => entry.table === "public.qstest_oitw");
+    expect(oitwIndexes).toHaveLength(2);
+    expect(oitwIndexes[0]!.columns).toEqual(["qty1", "itementry"]);
+    expect(oitwIndexes[0]!.includeColumns).toEqual([]);
+    expect(oitwIndexes[1]!.columns).toEqual(["itementry"]);
+    expect(oitwIndexes[1]!.includeColumns).toEqual(["qty1"]);
+
+    const oitmIndexes = diagnosis.indexSuggestions.filter((entry) => entry.table === "public.qstest_oitm");
+    expect(oitmIndexes).toHaveLength(2);
+    expect(oitmIndexes[0]!.columns).toEqual(["docentry"]);
+    expect(oitmIndexes[0]!.includeColumns).toEqual(["groupcode", "style"]);
+    expect(oitmIndexes[1]!.columns).toEqual(["groupcode"]);
+
+    const oitgIndex = diagnosis.indexSuggestions.find((entry) => entry.columns[0] === "groupcode" && entry.table === "qstest_oitg")!;
     expect(oitgIndex.includeColumns).toEqual(["groupname"]);
   });
 
