@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { ParsedExplainPlan } from "@/lib/diagram/explainPlan";
-import { buildCacheClearPlan, buildIndexSuggestionsFromSql, buildRewriteCandidates, diagnoseQueryPlan, extractReferencedRelations, extractPostgresFilterColumns, rewriteLiteralInLists, rewriteLowerLike, sqlShapeFindings } from "@/lib/diagnostics/queryDiagnostics";
+import { buildCacheClearPlan, buildIndexSuggestionsFromSql, buildRewriteCandidates, diagnoseQueryPlan, extractReferencedRelations, extractPostgresFilterColumns, hasColumnCast, rewriteLiteralInLists, rewriteLowerLike, sqlShapeFindings } from "@/lib/diagnostics/queryDiagnostics";
 
 const SQL_SERVER_XML = `<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
   <BatchSequence><Batch><Statements><StmtSimple StatementText="SELECT * FROM dbo.OTM o JOIN dbo.SAL s ON o.id = s.id WHERE o.shpcode = 'A'">
@@ -46,7 +46,7 @@ const PG_JSON = [
       "Plan Rows": 100,
       "Actual Rows": 48000,
       "Rows Removed by Filter": 950000,
-      Filter: "(status = 'A'::text) AND (created_at > '2024-01-01'::timestamp)",
+      Filter: "(status::text = 'A'::text) AND (created_at > '2024-01-01'::timestamp)",
       "Shared Hit Blocks": 10,
       "Shared Read Blocks": 4200,
     },
@@ -55,6 +55,51 @@ const PG_JSON = [
 
 function postgresPlan(): ParsedExplainPlan {
   return { databaseType: "postgres", nodes: [], raw: PG_JSON };
+}
+
+/** Multi-table aggregate whose real plan scans both base tables in parallel. */
+const MULTI_TABLE_SQL = `select t3.groupname,t2.style,sum(t1.qty1) qty1 from qstest_oitw
+t1 inner join qstest_oitm  t2 on t1.itementry=t2.docentry and t1.qty1!='0'
+inner join qstest_oitg  t3 on t3.groupcode=t2.groupcode
+group by t3.groupname ,t2.style`;
+
+const PG_JOIN_PLAN = [
+  {
+    "Planning Time": 0.31,
+    "Execution Time": 459.744,
+    JIT: { Functions: 87, Timing: { Total: 58.131 } },
+    Plan: {
+      "Node Type": "Hash Join",
+      "Actual Rows": 9034,
+      "Actual Loops": 1,
+      Plans: [
+        {
+          "Node Type": "Seq Scan",
+          "Relation Name": "qstest_oitm",
+          Schema: "public",
+          "Plan Rows": 622696,
+          "Actual Rows": 498257,
+          "Actual Loops": 3,
+          "Shared Read Blocks": 71947,
+        },
+        {
+          "Node Type": "Seq Scan",
+          "Relation Name": "qstest_oitw",
+          Schema: "public",
+          "Plan Rows": 55842,
+          "Actual Rows": 42994,
+          "Actual Loops": 3,
+          "Rows Removed by Filter": 1145092,
+          Filter: "(qty1 <> '0'::numeric)",
+          "Shared Read Blocks": 25907,
+        },
+      ],
+    },
+  },
+];
+
+function multiTablePlan(): ParsedExplainPlan {
+  return { databaseType: "postgres", nodes: [], raw: PG_JOIN_PLAN };
 }
 
 describe("query diagnostics", () => {
@@ -160,5 +205,72 @@ group by shpentry`;
     const rangeFirst = suggestions[1]!;
     expect(rangeFirst.columns).toEqual(["docdate", "shpentry"]);
     expect(rangeFirst.sql).toContain("(docdate, shpentry) INCLUDE (valueemp)");
+  });
+
+  it("keeps every index suggestion on the table that owns its columns", () => {
+    const suggestions = buildIndexSuggestionsFromSql(MULTI_TABLE_SQL, "postgres");
+    const forTable = (table: string) => suggestions.filter((entry) => entry.table === table);
+
+    // groupname belongs to qstest_oitg and style to qstest_oitm; neither may leak
+    // into the qstest_oitw suggestion.
+    const oitw = forTable("qstest_oitw");
+    expect(oitw).toHaveLength(1);
+    expect(oitw[0]!.columns).toEqual(["qty1", "itementry"]);
+    expect(oitw[0]!.includeColumns).toEqual([]);
+
+    const oitm = forTable("qstest_oitm");
+    expect(oitm).toHaveLength(1);
+    expect(oitm[0]!.columns).toEqual(["docentry", "groupcode"]);
+    expect(oitm[0]!.includeColumns).toEqual(["style"]);
+
+    const oitg = forTable("qstest_oitg");
+    expect(oitg).toHaveLength(1);
+    expect(oitg[0]!.columns).toEqual(["groupcode"]);
+    expect(oitg[0]!.includeColumns).toEqual(["groupname"]);
+    expect(oitg[0]!.sql).toContain("CREATE INDEX ON qstest_oitg (groupcode) INCLUDE (groupname);");
+  });
+
+  it("turns seq scans into concrete covering indexes instead of generic advice", () => {
+    const diagnosis = diagnoseQueryPlan(multiTablePlan(), MULTI_TABLE_SQL);
+    const scanFindings = diagnosis.findings.filter((finding) => finding.code === "postgres.seq-scan");
+    expect(scanFindings).toHaveLength(2);
+
+    const oitmFinding = scanFindings.find((finding) => finding.detail.includes("qstest_oitm"))!;
+    // No Filter is reported for this scan — the join key is the only reason it runs.
+    expect(oitmFinding.suggestion).toContain("(docentry) INCLUDE (groupcode, style)");
+    expect(oitmFinding.suggestion).toContain("嵌套循环");
+
+    const oitwFinding = scanFindings.find((finding) => finding.detail.includes("qstest_oitw"))!;
+    expect(oitwFinding.suggestion).toContain("(qty1) INCLUDE (itementry)");
+
+    // Plan hints win over the SQL pass when they describe the same column set,
+    // so the two duplicated SQL suggestions are dropped.
+    expect(diagnosis.indexSuggestions).toHaveLength(3);
+    const oitwIndex = diagnosis.indexSuggestions.find((entry) => entry.table === "public.qstest_oitw")!;
+    expect(oitwIndex.columns).toEqual(["qty1"]);
+    expect(oitwIndex.includeColumns).toEqual(["itementry"]);
+    expect(oitwIndex.sql).toContain("(qty1) INCLUDE (itementry)");
+    const oitmIndex = diagnosis.indexSuggestions.find((entry) => entry.table === "public.qstest_oitm")!;
+    expect(oitmIndex.columns).toEqual(["docentry"]);
+    expect(oitmIndex.includeColumns).toEqual(["groupcode", "style"]);
+    const oitgIndex = diagnosis.indexSuggestions.find((entry) => entry.columns[0] === "groupcode")!;
+    expect(oitgIndex.includeColumns).toEqual(["groupname"]);
+  });
+
+  it("reports JIT compilation overhead on a short query", () => {
+    const diagnosis = diagnoseQueryPlan(multiTablePlan(), MULTI_TABLE_SQL);
+    expect(diagnosis.findings.some((finding) => finding.code === "postgres.jit-overhead")).toBe(true);
+  });
+
+  it("flags a cast on the column but not on the constant", () => {
+    // `'0'::numeric` is on the literal side; Postgres adds it itself and the index stays usable.
+    expect(hasColumnCast("(qty1 <> '0'::numeric)")).toBe(false);
+    const literalCast = sqlShapeFindings("select * from t where qty <> '0' and status = 'A'::text", "postgres");
+    expect(literalCast.some((finding) => finding.code === "postgres.cast-in-where")).toBe(false);
+
+    expect(hasColumnCast("(status::text = 'A'::text)")).toBe(true);
+    expect(hasColumnCast("CAST(created_at AS date) = '2024-01-01'")).toBe(true);
+    const columnCast = sqlShapeFindings("select * from t where status::text = 'A'", "postgres");
+    expect(columnCast.some((finding) => finding.code === "postgres.cast-in-where")).toBe(true);
   });
 });

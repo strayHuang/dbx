@@ -147,13 +147,14 @@ interface SqlServerPlanFacts {
   relations: string[];
 }
 
-function parseSqlServerPlan(raw: unknown): SqlServerPlanFacts {
+function parseSqlServerPlan(raw: unknown, sql?: string): SqlServerPlanFacts {
   const empty: SqlServerPlanFacts = { findings: [], indexes: [], relations: [] };
   const xml = findShowPlanXml(raw);
   if (!xml || typeof DOMParser === "undefined") return empty;
   const document = new DOMParser().parseFromString(xml, "text/xml");
   if (document.querySelector("parsererror")) return empty;
 
+  const facts = sql ? deriveSqlColumnFacts(sql) : undefined;
   const findings: QueryDiagnosticFinding[] = [];
   const indexes: QueryIndexSuggestion[] = [];
   const relations: string[] = [];
@@ -200,6 +201,7 @@ function parseSqlServerPlan(raw: unknown): SqlServerPlanFacts {
   const logicalReads = rootRelOp ? numberAttr(rootRelOp, "ActualLogicalReads") : undefined;
 
   const scans: string[] = [];
+  const scannedTables: { display: string; relation: string; rows: number }[] = [];
   for (const relOp of Array.from(document.querySelectorAll("RelOp"))) {
     const physicalOp = relOp.getAttribute("PhysicalOp") || "";
     const object = relOp.querySelector("Object");
@@ -209,8 +211,10 @@ function parseSqlServerPlan(raw: unknown): SqlServerPlanFacts {
     const estimateRows = numberAttr(relOp, "EstimateRows") ?? 0;
     if (physicalOp === "Table Scan" && table && estimateRows >= 1000) {
       scans.push(`${schema || "dbo"}.${table}（预估 ${Math.round(estimateRows)} 行）`);
+      scannedTables.push({ display: `${schema || "dbo"}.${table}`, relation: table, rows: estimateRows });
     } else if (physicalOp === "Clustered Index Scan" && table && estimateRows >= 10000) {
       scans.push(`${schema || "dbo"}.${table} 聚集索引扫描（预估 ${Math.round(estimateRows)} 行）`);
+      scannedTables.push({ display: `${schema || "dbo"}.${table}`, relation: table, rows: estimateRows });
     }
     for (const scalar of Array.from(relOp.querySelectorAll("ScalarOperator"))) {
       const expression = scalar.getAttribute("ScalarString") || "";
@@ -226,12 +230,17 @@ function parseSqlServerPlan(raw: unknown): SqlServerPlanFacts {
     }
   }
   if (scans.length > 0) {
+    // Turn "big table scan" into the concrete index that removes it: join keys
+    // and output columns come from the query text, since the plan only reports
+    // the filters it chose to evaluate.
+    const hints = scannedTables.slice(0, 3).map((scan) => buildScanIndexHint({ databaseType: "sqlserver", table: scan.display, relation: scan.relation, facts, totalRows: scan.rows }));
+    for (const hint of hints) if (hint.index) indexes.push(hint.index);
     findings.push({
       severity: "critical",
       code: "sqlserver.table-scan",
       title: "大表扫描",
       detail: `执行计划包含大表扫描：${scans.slice(0, 4).join("；")}`,
-      suggestion: "检查 WHERE/JOIN 谓词列，建立覆盖索引或调整谓词写法。",
+      suggestion: hints.length > 0 ? hints.map((hint) => hint.text).join(" ") : "检查 WHERE/JOIN 谓词列，建立覆盖索引或调整谓词写法。",
     });
   }
 
@@ -255,8 +264,26 @@ interface PostgresPlanFacts {
   relations: string[];
 }
 
-function parsePostgresPlan(raw: unknown): PostgresPlanFacts {
+/** Total JIT compilation time (ms) from a plan's `JIT.Timing` block. */
+function jitTimingMs(root: Record<string, unknown>): number {
+  const jit = root["JIT"];
+  if (!jit || typeof jit !== "object") return 0;
+  const timing = (jit as Record<string, unknown>)["Timing"];
+  if (!timing || typeof timing !== "object") return 0;
+  const total = (timing as Record<string, unknown>)["Total"];
+  return typeof total === "number" ? total : 0;
+}
+
+function jitFunctionCount(root: Record<string, unknown>): number {
+  const jit = root["JIT"];
+  if (!jit || typeof jit !== "object") return 0;
+  const count = (jit as Record<string, unknown>)["Functions"];
+  return typeof count === "number" ? count : 0;
+}
+
+function parsePostgresPlan(raw: unknown, sql?: string): PostgresPlanFacts {
   const roots = Array.isArray(raw) ? raw : [raw];
+  const facts = sql ? deriveSqlColumnFacts(sql) : undefined;
   const findings: QueryDiagnosticFinding[] = [];
   const indexes: QueryIndexSuggestion[] = [];
   const relations: string[] = [];
@@ -264,6 +291,8 @@ function parsePostgresPlan(raw: unknown): PostgresPlanFacts {
   let planningTimeMs: number | undefined;
   let sharedHitBlocks = 0;
   let sharedReadBlocks = 0;
+  let jitMs = 0;
+  let jitFunctions = 0;
 
   for (const item of roots) {
     if (!item || typeof item !== "object") continue;
@@ -271,49 +300,76 @@ function parsePostgresPlan(raw: unknown): PostgresPlanFacts {
     if (typeof root["Execution Time"] === "number") executionTimeMs = root["Execution Time"];
     if (typeof root["Planning Time"] === "number") planningTimeMs = root["Planning Time"];
     const plan = (root.Plan ?? root) as Record<string, unknown>;
-    walkPostgresNode(plan, findings, indexes, relations);
+    walkPostgresNode(plan, { findings, indexes, relations, facts });
     sharedHitBlocks += Number(plan["Shared Hit Blocks"] ?? 0);
     sharedReadBlocks += Number(plan["Shared Read Blocks"] ?? 0);
+    jitMs += jitTimingMs(root);
+    jitFunctions += jitFunctionCount(root);
+  }
+
+  // JIT only pays for itself on CPU-bound work that runs long. On a few hundred
+  // milliseconds, emitting the compiled plan can cost more than the interpreted
+  // execution it replaces.
+  if (jitMs > 0 && executionTimeMs && jitMs / executionTimeMs >= 0.05) {
+    findings.push({
+      severity: "warning",
+      code: "postgres.jit-overhead",
+      title: "JIT 编译开销占比偏高",
+      detail: `JIT 编译耗时 ${jitMs.toFixed(1)} ms，占执行时间 ${Math.round((jitMs / executionTimeMs) * 100)}%${jitFunctions > 0 ? `（${jitFunctions} 个函数）` : ""}。`,
+      suggestion: "会话内 SET jit = off 重跑对比，或调高 jit_above_cost / jit_inline_above_cost，让这类短查询走解释执行。",
+    });
   }
 
   return { executionTimeMs, planningTimeMs, sharedHitBlocks, sharedReadBlocks, findings, indexes, relations: [...new Set(relations)] };
 }
 
-function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnosticFinding[], indexes: QueryIndexSuggestion[], relations: string[]): void {
+interface PostgresWalkContext {
+  findings: QueryDiagnosticFinding[];
+  indexes: QueryIndexSuggestion[];
+  relations: string[];
+  /** Query-text column usage, used to turn scans into concrete index advice. */
+  facts?: SqlColumnFacts;
+}
+
+function walkPostgresNode(node: Record<string, unknown>, ctx: PostgresWalkContext): void {
   const nodeType = String(node["Node Type"] ?? "");
   const relation = node["Relation Name"] ? String(node["Relation Name"]) : undefined;
   const schema = node["Schema"] ? String(node["Schema"]) : undefined;
-  if (relation) relations.push(schema ? `${schema}.${relation}` : relation);
+  if (relation) ctx.relations.push(schema ? `${schema}.${relation}` : relation);
 
   const rowsRemoved = Number(node["Rows Removed by Filter"] ?? 0);
   const filter = node["Filter"] ? String(node["Filter"]) : undefined;
   const actualRows = Number(node["Actual Rows"] ?? 0);
   const planRows = Number(node["Plan Rows"] ?? 0);
+  const loops = Number(node["Actual Loops"] ?? 1) || 1;
 
   if (relation && nodeType.includes("Seq Scan") && (rowsRemoved >= 1000 || actualRows >= 10000)) {
-    const columns = filter ? extractPostgresFilterColumns(filter) : [];
-    findings.push({
+    const filterColumns = filter ? extractPostgresFilterColumns(filter) : [];
+    const detailTable = schema ? `${schema}.${relation}` : relation;
+    const hint = buildScanIndexHint({
+      databaseType: "postgres",
+      table: detailTable,
+      relation,
+      facts: ctx.facts,
+      filterColumns,
+      totalRows: actualRows * loops,
+      removedRows: rowsRemoved * loops,
+      readBlocks: Number(node["Shared Read Blocks"] ?? 0) || undefined,
+      loops,
+    });
+    ctx.findings.push({
       severity: "critical",
       code: "postgres.seq-scan",
       title: "顺序扫描大表",
-      detail: `${schema ? `${schema}.` : ""}${relation} 使用 Seq Scan，实际返回 ${actualRows} 行${rowsRemoved > 0 ? `，过滤掉 ${rowsRemoved} 行` : ""}${filter ? `；Filter: ${filter}` : ""}`,
-      suggestion: columns.length > 0 ? `考虑为过滤列建索引：${columns.join(", ")}` : "检查过滤条件是否有可索引的列。",
+      detail: `${detailTable} 使用 Seq Scan，实际返回 ${Math.round(actualRows * loops)} 行${rowsRemoved > 0 ? `，过滤掉 ${Math.round(rowsRemoved * loops)} 行` : ""}${filter ? `；Filter: ${filter}` : ""}`,
+      suggestion: hint.text,
     });
-    if (columns.length > 0) {
-      const table = schema ? `${schema}.${relation}` : relation;
-      indexes.push({
-        table,
-        columns,
-        includeColumns: [],
-        sql: `CREATE INDEX ON ${quoteIdentifier(schema)}.${quoteIdentifier(relation)} (${columns.map((column) => quoteIdentifier(column)).join(", ")});`,
-        reason: "Seq Scan 的过滤列",
-      });
-    }
+    if (hint.index) ctx.indexes.push(hint.index);
   }
 
   const sortMethod = node["Sort Method"] ? String(node["Sort Method"]) : undefined;
   if (nodeType === "Sort" && sortMethod && sortMethod.toLowerCase().includes("external")) {
-    findings.push({
+    ctx.findings.push({
       severity: "warning",
       code: "postgres.sort-spill",
       title: "排序溢出到磁盘",
@@ -324,7 +380,7 @@ function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnost
 
   const heapFetches = Number(node["Heap Fetches"] ?? 0);
   if (nodeType.includes("Index Only Scan") && heapFetches > 0) {
-    findings.push({
+    ctx.findings.push({
       severity: "warning",
       code: "postgres.heap-fetches",
       title: "Index Only Scan 仍需回表",
@@ -335,7 +391,7 @@ function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnost
 
   const joinFilterRemoved = Number(node["Rows Removed by Join Filter"] ?? 0);
   if (nodeType === "Nested Loop" && joinFilterRemoved >= 1000) {
-    findings.push({
+    ctx.findings.push({
       severity: "warning",
       code: "postgres.join-filter",
       title: "连接条件过滤掉大量行",
@@ -347,7 +403,7 @@ function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnost
   if (planRows > 0 && actualRows > 0) {
     const ratio = Math.max(actualRows / planRows, planRows / actualRows);
     if (ratio >= 10 && actualRows >= 100) {
-      findings.push({
+      ctx.findings.push({
         severity: "info",
         code: "postgres.estimate-drift",
         title: "行数估算偏差较大",
@@ -357,8 +413,10 @@ function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnost
     }
   }
 
-  if (filter && /::\s*(text|character varying|numeric|timestamp|date|integer|bigint)\b/i.test(filter)) {
-    findings.push({
+  // A cast of the *literal* side (`qty1 <> '0'::numeric`) keeps the column's
+  // index usable; only a cast wrapping the column invalidates it.
+  if (filter && hasColumnCast(filter)) {
+    ctx.findings.push({
       severity: "warning",
       code: "postgres.implicit-cast",
       title: "谓词中存在类型转换",
@@ -367,7 +425,7 @@ function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnost
     });
   }
   if (filter && /\b(lower|upper|trim|substr|substring|date_trunc|to_char)\s*\(/i.test(filter)) {
-    findings.push({
+    ctx.findings.push({
       severity: "warning",
       code: "postgres.function-on-column",
       title: "过滤列被函数包裹",
@@ -379,7 +437,7 @@ function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnost
   const plans = node.Plans;
   if (Array.isArray(plans)) {
     for (const child of plans) {
-      if (child && typeof child === "object") walkPostgresNode(child as Record<string, unknown>, findings, indexes, relations);
+      if (child && typeof child === "object") walkPostgresNode(child as Record<string, unknown>, ctx);
     }
   }
 }
@@ -387,6 +445,18 @@ function walkPostgresNode(node: Record<string, unknown>, findings: QueryDiagnost
 function quoteIdentifier(value: string | undefined): string {
   if (!value) return "";
   return /^[a-z_][\w$]*$/.test(value) ? value : `"${value.replace(/"/g, '""')}"`;
+}
+
+/**
+ * True only when a *column* — not a literal — carries a cast. Postgres rewrites
+ * `col > 5` to `col > '5'::numeric`; that literal cast keeps the index usable,
+ * while `col::text > '5'` invalidates it.
+ */
+export function hasColumnCast(expression: string): boolean {
+  if (/\bcast\s*\(\s*[A-Za-z_][\w$]*(?:\s*\.\s*[A-Za-z_][\w$]*)?\s+as\s+/i.test(expression)) return true;
+  if (/\(\s*[A-Za-z_][\w$]*(?:\s*\.\s*[A-Za-z_][\w$]*)?\s*\)\s*::/i.test(expression)) return true;
+  // Bare `col::type`; a literal starts with a quote or digit, so it never matches.
+  return /[A-Za-z_][\w$]*(?:\s*\.\s*[A-Za-z_][\w$]*)?\s*::\s*[A-Za-z_]/i.test(expression);
 }
 
 /** Columns used by simple comparison predicates in a PostgreSQL Filter expression. */
@@ -397,6 +467,9 @@ export function extractPostgresFilterColumns(filter: string): string[] {
     const column = match[1];
     if (!column) continue;
     if (/^(and|or|not|null|true|false)$/i.test(column)) continue;
+    // `col::numeric > 5` makes the type name look like a cmp column; skip it.
+    const before = filter.slice(Math.max(0, (match.index ?? 0) - 4), match.index ?? 0);
+    if (before.endsWith("::")) continue;
     columns.add(column);
   }
   return [...columns].slice(0, 4);
@@ -404,7 +477,7 @@ export function extractPostgresFilterColumns(filter: string): string[] {
 
 export function diagnoseQueryPlan(plan: ParsedExplainPlan, sql: string): QueryDiagnosisCore {
   if (plan.databaseType === "sqlserver") {
-    const facts = parseSqlServerPlan(plan.raw);
+    const facts = parseSqlServerPlan(plan.raw, sql);
     return {
       databaseType: plan.databaseType,
       metrics: { elapsedMs: facts.elapsedMs, cpuMs: facts.cpuMs, logicalReads: facts.logicalReads },
@@ -414,7 +487,7 @@ export function diagnoseQueryPlan(plan: ParsedExplainPlan, sql: string): QueryDi
     };
   }
   if (plan.databaseType === "postgres") {
-    const facts = parsePostgresPlan(plan.raw);
+    const facts = parsePostgresPlan(plan.raw, sql);
     return {
       databaseType: plan.databaseType,
       metrics: {
@@ -432,12 +505,58 @@ export function diagnoseQueryPlan(plan: ParsedExplainPlan, sql: string): QueryDi
 }
 
 function mergeIndexSuggestions(planSuggestions: QueryIndexSuggestion[], sqlSuggestions: QueryIndexSuggestion[]): QueryIndexSuggestion[] {
-  const seen = new Set<string>();
+  const bareName = (table: string) => {
+    const lower = table.toLowerCase();
+    return lower.split(".").pop() ?? lower;
+  };
+  // The query text often omits the schema (`qstest_oitw`) while the plan reports
+  // it (`public.qstest_oitw`). Resolve the bare name to the plan's qualified name,
+  // but only when it is unambiguous — two schemas may share a table name.
+  const qualifiedByBare = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  for (const suggestion of planSuggestions) {
+    const bare = bareName(suggestion.table);
+    if (ambiguous.has(bare)) continue;
+    const full = suggestion.table.toLowerCase();
+    const known = qualifiedByBare.get(bare);
+    if (known === undefined) qualifiedByBare.set(bare, full);
+    else if (known !== full) {
+      ambiguous.add(bare);
+      qualifiedByBare.delete(bare);
+    }
+  }
+  const canonicalTable = (table: string) => {
+    const lower = table.toLowerCase();
+    if (lower.includes(".")) return lower;
+    return qualifiedByBare.get(lower) ?? lower;
+  };
+
+  const seenKeys = new Set<string>();
+  const planColumnSets = new Set<string>();
   const merged: QueryIndexSuggestion[] = [];
-  for (const suggestion of [...planSuggestions, ...sqlSuggestions]) {
-    const key = `${suggestion.table.toLowerCase()}\0${suggestion.columns.map((column) => column.toLowerCase()).join(",")}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+  const keyOf = (suggestion: QueryIndexSuggestion) => `${canonicalTable(suggestion.table)}\0${suggestion.columns.map((column) => column.toLowerCase()).join(",")}`;
+  // Key ∪ INCLUDE. A plan hint and a SQL hint carrying the same columns describe
+  // the same physical index; the plan version wins because it already reflects
+  // the access path the optimizer chose. Only plan suggestions are registered
+  // here, so the SQL-side equality-first / range-first pair is still kept.
+  const columnSetOf = (suggestion: QueryIndexSuggestion) =>
+    `${canonicalTable(suggestion.table)}\0${[...suggestion.columns, ...suggestion.includeColumns]
+      .map((column) => column.toLowerCase())
+      .sort()
+      .join(",")}`;
+
+  for (const suggestion of planSuggestions) {
+    const key = keyOf(suggestion);
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    planColumnSets.add(columnSetOf(suggestion));
+    merged.push(suggestion);
+  }
+  for (const suggestion of sqlSuggestions) {
+    const key = keyOf(suggestion);
+    if (seenKeys.has(key)) continue;
+    if (planColumnSets.has(columnSetOf(suggestion))) continue;
+    seenKeys.add(key);
     merged.push(suggestion);
   }
   return merged;
@@ -561,6 +680,232 @@ const NON_COLUMN_WORDS = new Set([
   "filter",
 ]);
 
+/** Column roles an alias plays in the query text. */
+export interface AliasColumnUsage {
+  /** `col = value`, `col <> value`, `col IN (…)` — the leading key columns. */
+  equality: string[];
+  /** `col BETWEEN …`, `col > value` — trailing key columns. */
+  range: string[];
+  /** Both sides of `a.x = b.y`; each side records its own column. */
+  join: string[];
+  /** SELECT list / GROUP BY / aggregate inputs — INCLUDE candidates. */
+  output: string[];
+}
+
+export interface SqlColumnFacts {
+  aliases: SqlTableAlias[];
+  /** Keyed by lower-cased alias. */
+  usage: Map<string, AliasColumnUsage>;
+}
+
+/** Strips comments and string literals so values can never look like columns. */
+function stripSqlNoise(sql: string): string {
+  return sql
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/'(?:''|[^'])*'/g, "''");
+}
+
+function addUnique(list: string[], value: string): void {
+  const normalized = value.toLowerCase();
+  if (!list.some((existing) => existing.toLowerCase() === normalized)) list.push(value);
+}
+
+function uniqueColumns(columns: readonly string[]): string[] {
+  const unique: string[] = [];
+  for (const column of columns) addUnique(unique, column);
+  return unique;
+}
+
+const COLUMN_REFERENCE = /([A-Za-z_][\w$]*)\.([A-Za-z_][\w$]*)/g;
+/** `x = b.y` — the reference is the left operand of a column-to-column comparison. */
+const JOIN_AFTER = /^[\s)]*(?:=|<>|!=)[\s(]*([A-Za-z_][\w$]*)\.([A-Za-z_][\w$]*)/;
+/** `a.x = …` right before the reference — it is the right operand of that comparison. */
+const JOIN_BEFORE = /([A-Za-z_][\w$]*)\.([A-Za-z_][\w$]*)[\s)]*(?:=|<>|!=)[\s(]*$/;
+
+/**
+ * Classifies every `alias.column` reference per alias.
+ *
+ * A join comparison marks **both** sides: without the right-hand side the
+ * joined-to table never receives its join key, which is exactly the index that
+ * turns a nested loop into an index scan.
+ */
+export function deriveSqlColumnFacts(sql: string): SqlColumnFacts {
+  const aliases = extractSqlTableAliases(sql);
+  const usage = new Map<string, AliasColumnUsage>();
+  if (aliases.length === 0) return { aliases, usage };
+  const aliasSet = new Map(aliases.map((entry) => [entry.alias.toLowerCase(), entry]));
+  const scan = stripSqlNoise(sql);
+
+  const usageFor = (alias: string): AliasColumnUsage => {
+    const key = alias.toLowerCase();
+    let bucket = usage.get(key);
+    if (!bucket) {
+      bucket = { equality: [], range: [], join: [], output: [] };
+      usage.set(key, bucket);
+    }
+    return bucket;
+  };
+
+  for (const match of scan.matchAll(COLUMN_REFERENCE)) {
+    const aliasKey = match[1]!.toLowerCase();
+    if (!aliasSet.has(aliasKey)) continue;
+    const column = match[2]!;
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    const after = scan.slice(end, end + 64);
+    const before = scan.slice(Math.max(0, start - 64), start);
+
+    const joinAfter = JOIN_AFTER.exec(after);
+    if (joinAfter && aliasSet.has(joinAfter[1]!.toLowerCase())) {
+      addUnique(usageFor(aliasKey).join, column);
+      addUnique(usageFor(joinAfter[1]!).join, joinAfter[2]!);
+      continue;
+    }
+    const joinBefore = JOIN_BEFORE.exec(before);
+    if (joinBefore && aliasSet.has(joinBefore[1]!.toLowerCase())) {
+      addUnique(usageFor(aliasKey).join, column);
+      addUnique(usageFor(joinBefore[1]!).join, joinBefore[2]!);
+      continue;
+    }
+
+    if (/^[\s)]*between\b/i.test(after)) {
+      addUnique(usageFor(aliasKey).range, column);
+    } else if (/^[\s)]*in\s*\(/i.test(after)) {
+      addUnique(usageFor(aliasKey).equality, column);
+    } else if (/^[\s)]*(?:=|<>|!=)[\s(]*(?:'|\?|\d|any\s*\(|array\[|null|true|false)/i.test(after)) {
+      addUnique(usageFor(aliasKey).equality, column);
+    } else if (/^[\s)]*(?:>=|<=|>|<)[\s(]*(?:'|\?|\d|any\s*\(|array\[)/i.test(after)) {
+      addUnique(usageFor(aliasKey).range, column);
+    } else if (/['\d)]\s*(?:=|<>|!=)\s*$/.test(before)) {
+      // Reversed value comparison: `'A' = status`, `1 <> qty`.
+      addUnique(usageFor(aliasKey).equality, column);
+    } else if (/['\d)]\s*(?:>=|<=|>|<)\s*$/.test(before)) {
+      addUnique(usageFor(aliasKey).range, column);
+    }
+  }
+
+  // SELECT list, GROUP BY and aggregate inputs become INCLUDE candidates.
+  const selectBody = /\bselect\b([\s\S]*?)\bfrom\b/i.exec(scan)?.[1] ?? "";
+  const groupBody = /\bgroup\s+by\b([\s\S]*?)(?:\b(?:having|order\s+by|limit|offset)\b|$)/i.exec(scan)?.[1] ?? "";
+  const primaryAlias = aliases[0]?.alias.toLowerCase();
+  for (const body of [selectBody, groupBody]) {
+    for (const match of body.matchAll(COLUMN_REFERENCE)) {
+      const aliasKey = match[1]!.toLowerCase();
+      if (!aliasSet.has(aliasKey)) continue;
+      addUnique(usageFor(aliasKey).output, match[2]!);
+    }
+    if (!primaryAlias) continue;
+    // Blank out `alias.column` before looking for unqualified columns; otherwise
+    // `t3.groupname` would be filed as a column of the primary relation.
+    const masked = body.replace(COLUMN_REFERENCE, (full: string) => " ".repeat(full.length));
+    for (const match of masked.matchAll(/\b([A-Za-z_][\w$]*)\b(?!\s*\()/g)) {
+      const word = match[1]!;
+      const lower = word.toLowerCase();
+      if (NON_COLUMN_WORDS.has(lower) || aliasSet.has(lower) || /^\d/.test(word)) continue;
+      // Skip projection aliases: they follow a closing paren or a numeric literal.
+      const before = masked.slice(Math.max(0, (match.index ?? 0) - 16), match.index ?? 0);
+      if (/[)\d]\s*$/.test(before)) continue;
+      addUnique(usageFor(primaryAlias).output, word);
+    }
+  }
+
+  return { aliases, usage };
+}
+
+/** Merges the usage of every alias bound to `relation` (self-joins included). */
+function usageForRelation(facts: SqlColumnFacts | undefined, relation: string): AliasColumnUsage | undefined {
+  if (!facts) return undefined;
+  const wanted = relation.toLowerCase();
+  const wantedBare = wanted.split(".").pop() ?? wanted;
+  const merged: AliasColumnUsage = { equality: [], range: [], join: [], output: [] };
+  let matched = false;
+  for (const entry of facts.aliases) {
+    const table = entry.table.toLowerCase();
+    const bare = table.split(".").pop() ?? table;
+    if (table !== wanted && bare !== wantedBare) continue;
+    const usage = facts.usage.get(entry.alias.toLowerCase());
+    if (!usage) continue;
+    matched = true;
+    for (const role of ["equality", "range", "join", "output"] as const) {
+      for (const column of usage[role]) addUnique(merged[role], column);
+    }
+  }
+  return matched ? merged : undefined;
+}
+
+/** Row/block counts read better as `149 万` than as `1494773`. */
+function formatCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  if (value >= 10000) return `${Math.round(value / 10000)} 万`;
+  return String(Math.round(value));
+}
+
+interface ScanIndexHintInput {
+  databaseType: string;
+  /** Table as shown to the user (`public.qstest_oitm`). */
+  table: string;
+  /** Bare relation name from the plan, used to look up query-text column usage. */
+  relation: string;
+  facts?: SqlColumnFacts;
+  /** Columns the plan actually evaluated in `Filter`, when it reported any. */
+  filterColumns?: string[];
+  totalRows: number;
+  removedRows?: number;
+  readBlocks?: number;
+  /** Parallel workers that ran this scan (`Actual Loops`). */
+  loops?: number;
+}
+
+type IndexSuggestionVariant = "equality-first" | "range-first" | "scan-hint";
+
+const INDEX_VARIANT_REASON: Record<IndexSuggestionVariant, string> = {
+  "equality-first": "来自 SQL 谓词与输出列推导（等值列在前、范围列在后，输出列放 INCLUDE）",
+  "range-first": "对照方案：范围列在前（部分优化器在范围选择性更高时更优），输出列放 INCLUDE",
+  "scan-hint": "来自执行计划中的顺序扫描：过滤/连接列作键列，其余连接列与输出列放 INCLUDE",
+};
+
+/**
+ * Turns "this table is scan-only" into the specific index that removes the scan.
+ *
+ * The plan alone only knows which filters *it* evaluated, which is empty for
+ * scans that exist purely because of a join key. Join columns and output
+ * columns are therefore taken from the query text.
+ */
+function buildScanIndexHint(input: ScanIndexHintInput): { text: string; index?: QueryIndexSuggestion } {
+  const usage = usageForRelation(input.facts, input.relation);
+  const planFilters = uniqueColumns(input.filterColumns ?? []);
+  const equality = uniqueColumns(usage?.equality ?? []);
+  const joins = uniqueColumns(usage?.join ?? []);
+  const outputs = uniqueColumns(usage?.output ?? []);
+  const filters = planFilters.length > 0 ? planFilters : equality;
+
+  const keyColumns = filters.length > 0 ? filters.slice(0, 3) : joins.length > 0 ? [joins[0]!] : [];
+  const workers = input.loops && input.loops > 1 ? `（${input.loops} 个并行进程）` : "";
+  const scope = `本次扫描约 ${formatCount(input.totalRows)}行${workers}${input.removedRows && input.removedRows >= 1000 ? `（过滤掉 ${formatCount(input.removedRows)}行）` : ""}${input.readBlocks ? `，读取 ${formatCount(input.readBlocks)}个块` : ""}`;
+
+  if (keyColumns.length === 0) {
+    return { text: `未从 SQL 中解析出 ${input.table} 的过滤/连接列，请补全 WHERE/JOIN 谓词后再评估索引；${scope}。` };
+  }
+
+  const includeColumns = uniqueColumns([...equality, ...joins, ...outputs])
+    .filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase()))
+    .slice(0, 6);
+  const index = buildIndexSuggestionSql(input.table, keyColumns, includeColumns, input.databaseType, "scan-hint");
+  const indexText = `(${keyColumns.join(", ")})${includeColumns.length > 0 ? ` INCLUDE (${includeColumns.join(", ")})` : ""}`;
+
+  if (filters.length > 0) {
+    return {
+      text: `为 ${input.table} 建立索引 ${indexText}：过滤列作键列${includeColumns.length > 0 ? "，连接列与输出列放 INCLUDE 后可走 Index Only Scan" : ""}，直接定位命中的行，避免整表顺序扫描（${scope}）。`,
+      index,
+    };
+  }
+  return {
+    text: `${input.table} 的扫描来自连接等值而非自身过滤条件，应在连接列上建索引 ${indexText}：优化器可用嵌套循环 + Index Scan 按连接键逐行取数，避免整表顺序扫描（${scope}）。`,
+    index,
+  };
+}
+
 /**
  * Derives composite covering-index suggestions directly from the query text.
  *
@@ -568,110 +913,34 @@ const NON_COLUMN_WORDS = new Set([
  * (SQL Server MissingIndexes, PostgreSQL per-row Filters), so BETWEEN range
  * joins, IN lists and aggregate inputs are routinely missing. This pass reads
  * WHERE/ON predicates per alias, then adds SELECT/GROUP BY/aggregate columns as
- * INCLUDE columns: equality columns first, range columns after them.
+ * INCLUDE columns: equality and join columns first, range columns after them.
  */
 export function buildIndexSuggestionsFromSql(sql: string, databaseType: string): QueryIndexSuggestion[] {
-  const aliases = extractSqlTableAliases(sql);
-  if (aliases.length === 0) return [];
-  const aliasSet = new Map(aliases.map((entry) => [entry.alias.toLowerCase(), entry]));
-  // Strip comments and string literals before scanning so values never look like columns.
-  const scan = sql
-    .replace(/--[^\n]*/g, " ")
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/'(?:''|[^'])*'/g, "''");
-
-  const buckets = new Map<string, { equality: string[]; range: string[]; include: string[] }>();
-  const bucketFor = (alias: string) => {
-    const key = alias.toLowerCase();
-    let bucket = buckets.get(key);
-    if (!bucket) {
-      bucket = { equality: [], range: [], include: [] };
-      buckets.set(key, bucket);
-    }
-    return bucket;
-  };
-  const pushUnique = (list: string[], value: string) => {
-    const normalized = value.toLowerCase();
-    if (!list.some((existing) => existing.toLowerCase() === normalized)) list.push(value);
-  };
-
-  // Predicate classification from each `alias.column` reference.
-  const columnReference = /([A-Za-z_][\w$]*)\.([A-Za-z_][\w$]*)/g;
-  for (const match of scan.matchAll(columnReference)) {
-    const alias = match[1]!.toLowerCase();
-    const column = match[2]!;
-    if (!aliasSet.has(alias)) continue;
-    const rest = scan.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 48);
-    const bucket = bucketFor(alias);
-    if (/^\s+between\b/i.test(rest)) {
-      pushUnique(bucket.range, column);
-    } else if (/^\s+in\s*\(/i.test(rest)) {
-      pushUnique(bucket.equality, column);
-    } else if (/^\s*(?:=|<>|!=)\s*(?:'|\?|\d|any\s*\(|array\[|null)/i.test(rest)) {
-      pushUnique(bucket.equality, column);
-    } else if (/^\s*(?:>=|<=|>|<)\s*(?:'|\?|\d|any\s*\(|array\[)/i.test(rest)) {
-      pushUnique(bucket.range, column);
-    } else {
-      // Join equality: `a.x = b.y` marks x on a as a key column.
-      const joinEquality = /^\s*=\s*([A-Za-z_][\w$]*)\.[A-Za-z_][\w$]*/i.exec(rest);
-      if (joinEquality && aliasSet.has(joinEquality[1]!.toLowerCase())) pushUnique(bucket.equality, column);
-    }
-  }
-
-  // SELECT list, GROUP BY and aggregate inputs become INCLUDE candidates.
-  const selectMatch = /\bselect\b([\s\S]*?)\bfrom\b/i.exec(scan);
-  const groupMatch = /\bgroup\s+by\b([\s\S]*?)(?:\b(?:having|order\s+by|limit|offset)\b|$)/i.exec(scan);
-  const referenced = new Map<string, string[]>();
-  const addReferenced = (alias: string, column: string) => {
-    const key = alias.toLowerCase();
-    let list = referenced.get(key);
-    if (!list) {
-      list = [];
-      referenced.set(key, list);
-    }
-    pushUnique(list, column);
-  };
-  // Unqualified SELECT/GROUP BY columns belong to the primary FROM relation.
-  const primaryAlias = aliases[0]?.alias.toLowerCase();
-  for (const source of [selectMatch?.[1] ?? "", groupMatch?.[1] ?? ""]) {
-    for (const match of source.matchAll(columnReference)) {
-      const alias = match[1]!.toLowerCase();
-      if (!aliasSet.has(alias)) continue;
-      addReferenced(alias, match[2]!);
-    }
-    if (primaryAlias) {
-      for (const match of source.matchAll(/\b([A-Za-z_][\w$]*)\b(?!\s*\()/g)) {
-        const word = match[1]!;
-        const lower = word.toLowerCase();
-        if (NON_COLUMN_WORDS.has(lower) || aliasSet.has(lower) || /^\d/.test(word)) continue;
-        // Skip projection aliases: they follow a closing paren or a numeric literal.
-        const before = source.slice(Math.max(0, (match.index ?? 0) - 16), match.index ?? 0);
-        if (/[)\d]\s*$/.test(before)) continue;
-        addReferenced(primaryAlias, word);
-      }
-    }
-  }
-
+  const facts = deriveSqlColumnFacts(sql);
   const suggestions: QueryIndexSuggestion[] = [];
-  for (const [aliasKey, bucket] of buckets) {
-    const entry = aliasSet.get(aliasKey);
-    if (!entry) continue;
-    const keyColumns = [...bucket.equality, ...bucket.range].slice(0, 4);
+  for (const entry of facts.aliases) {
+    const usage = facts.usage.get(entry.alias.toLowerCase());
+    if (!usage) continue;
+    const equalityOrJoin = uniqueColumns([...usage.equality, ...usage.join]);
+    const range = uniqueColumns(usage.range);
+    const keyColumns = uniqueColumns([...equalityOrJoin, ...range]).slice(0, 4);
     if (keyColumns.length === 0) continue;
-    const includeColumns = (referenced.get(aliasKey) ?? []).filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase())).slice(0, 6);
+    const includeColumns = uniqueColumns(usage.output)
+      .filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase()))
+      .slice(0, 6);
     suggestions.push(buildIndexSuggestionSql(entry.table, keyColumns, includeColumns, databaseType, "equality-first"));
     // 等值与范围列都存在时，同时给出范围列在前的对照方案，便于实际执行后对比。
-    if (bucket.equality.length > 0 && bucket.range.length > 0) {
-      const rangeFirst = [...bucket.range, ...bucket.equality].slice(0, 4);
+    if (equalityOrJoin.length > 0 && range.length > 0) {
+      const rangeFirst = uniqueColumns([...range, ...equalityOrJoin]).slice(0, 4);
       suggestions.push(buildIndexSuggestionSql(entry.table, rangeFirst, includeColumns, databaseType, "range-first"));
     }
   }
   return suggestions;
 }
 
-function buildIndexSuggestionSql(table: string, columns: string[], includeColumns: string[], databaseType: string, variant: "equality-first" | "range-first"): QueryIndexSuggestion {
+function buildIndexSuggestionSql(table: string, columns: string[], includeColumns: string[], databaseType: string, variant: IndexSuggestionVariant = "equality-first", reason?: string): QueryIndexSuggestion {
   const [schema, name] = table.includes(".") ? (table.split(".") as [string, string]) : [undefined, table];
-  const reason = variant === "equality-first" ? "来自 SQL 谓词与输出列推导（等值列在前、范围列在后，输出列放 INCLUDE）" : "对照方案：范围列在前（部分优化器在范围选择性更高时更优），输出列放 INCLUDE";
+  const why = reason ?? INDEX_VARIANT_REASON[variant];
   if (databaseType === "sqlserver") {
     const suffix = variant === "range-first" ? "_R" : "";
     const indexName = `IX_${name.replace(/[^\w]/g, "")}_${columns.map((column) => column.replace(/[^\w]/g, "")).join("_")}${suffix}`.slice(0, 120);
@@ -682,7 +951,7 @@ function buildIndexSuggestionSql(table: string, columns: string[], includeColumn
       columns,
       includeColumns,
       sql: `CREATE NONCLUSTERED INDEX ${indexName}\nON ${target} (${columns.map((column) => `[${column}]`).join(", ")})${includeClause};`,
-      reason,
+      reason: why,
     };
   }
   const quotedTable = schema ? `${quoteIdentifier(schema)}.${quoteIdentifier(name)}` : quoteIdentifier(name);
@@ -692,7 +961,7 @@ function buildIndexSuggestionSql(table: string, columns: string[], includeColumn
     columns,
     includeColumns,
     sql: `CREATE INDEX ON ${quotedTable} (${columns.map((column) => quoteIdentifier(column)).join(", ")})${includeClause};`,
-    reason,
+    reason: why,
   };
 }
 
@@ -822,13 +1091,18 @@ function postgresShapeFindings(sql: string, normalized: string): QueryDiagnostic
       suggestion: "改写为范围条件：col >= '2024-01-01' AND col < '2024-01-02'。",
     });
   }
-  if (/\bwhere[^;]*::\s*(text|varchar|character varying|numeric|int|integer|bigint|date|timestamp)\b/i.test(normalized)) {
+  // Only the predicate zone is checked: a cast in the projection (`SELECT col::text`)
+  // never touches index usability, and `'0'::numeric` on the constant side is
+  // added by Postgres itself.
+  const predicateStart = normalized.search(/\b(?:where|having)\b/i);
+  const predicateBody = predicateStart >= 0 ? normalized.slice(predicateStart) : "";
+  if (predicateBody && hasColumnCast(predicateBody)) {
     findings.push({
       severity: "warning",
       code: "postgres.cast-in-where",
       title: "谓词中显式类型转换",
-      detail: "在列或参数上追加 `::type` 会让索引无法按原类型比较。",
-      suggestion: "让列与参数类型一致；无法一致时建立表达式索引。",
+      detail: "列被显式转换（`col::type` / `CAST(col AS type)`）时索引无法按原类型比较；常量侧的 `'x'::type` 不影响索引。",
+      suggestion: "让列与参数类型一致；无法一致时建立表达式索引（如 CREATE INDEX ON t ((col::text))）。",
     });
   }
   if (/\border\s+by\s+random\s*\(/i.test(normalized)) {
