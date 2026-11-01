@@ -10139,6 +10139,7 @@ export const useQueryStore = defineStore("query", () => {
         };
       }
       const trials: HypopgTrial[] = [];
+      let baseCost: number | undefined;
       for (const group of planHypopgTrials(suggestions)) {
         const indexNames: string[] = [];
         try {
@@ -10151,9 +10152,11 @@ export const useQueryStore = defineStore("query", () => {
           // 假设索引只对不带 ANALYZE 的 EXPLAIN 生效；带上 ANALYZE 会退回真实计划。
           const explain = await run(`EXPLAIN (FORMAT JSON) ${sql.trim().replace(/;+\s*$/, "")}`);
           const comparison = compareHypotheticalPlan(basePlan.raw, parseExplainResult("postgres", explain).raw, indexNames);
+          baseCost ??= comparison.baseCost;
           trials.push({
             id: group.id,
             title: group.title,
+            candidateRefs: group.candidateRefs,
             indexSqls: group.indexSqls,
             indexNames,
             used: comparison.used,
@@ -10163,7 +10166,7 @@ export const useQueryStore = defineStore("query", () => {
             accessNodeTypes: comparison.accessNodeTypes,
           });
         } catch (error: any) {
-          trials.push({ id: group.id, title: group.title, indexSqls: group.indexSqls, indexNames, used: false, error: String(error?.message || error) });
+          trials.push({ id: group.id, title: group.title, candidateRefs: group.candidateRefs, indexSqls: group.indexSqls, indexNames, used: false, error: String(error?.message || error) });
         }
       }
       await resetHypotheticalIndexes();
@@ -10176,6 +10179,7 @@ export const useQueryStore = defineStore("query", () => {
         promptSuppressed,
         profile,
         trials,
+        baseCost,
         note: autoCreatedVersion ? t("diagnostics.hypopgAutoCreated", { version: autoCreatedVersion }) : undefined,
       };
     } catch (error: any) {

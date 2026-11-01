@@ -4,8 +4,9 @@ import { useI18n } from "vue-i18n";
 import { AlertTriangle, Ban, CheckCircle2, Clock, Copy, FlaskConical, Gauge, Info, Loader2, Package, RefreshCw, Snowflake, Sun } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { QueryDiagnosis, QueryDiagnosticFinding } from "@/lib/diagnostics/queryDiagnostics";
+import type { QueryDiagnosis, QueryDiagnosticFinding, QueryIndexSuggestion } from "@/lib/diagnostics/queryDiagnostics";
 import type { HypopgTrial } from "@/lib/diagnostics/hypopgSupport";
+import { estimateElapsedMs, formatPlanCost, pickBestHypopgTrial } from "@/lib/diagnostics/hypopgSupport";
 
 const props = withDefaults(
   defineProps<{
@@ -82,12 +83,66 @@ const decideHypopg = (decision: "later" | "never") => {
 
 const hypopgTrialVerdict = (trial: HypopgTrial) => (trial.used ? t("diagnostics.hypopgSelected") : t("diagnostics.hypopgNotSelected"));
 
-const hypopgTrialCost = (trial: HypopgTrial) => {
-  if (trial.error) return trial.error;
-  if (trial.hypotheticalCost === undefined) return "-";
-  const delta = trial.costDeltaPct === undefined ? "" : `（${trial.costDeltaPct > 0 ? "+" : ""}${trial.costDeltaPct.toFixed(1)}%）`;
-  return `${trial.hypotheticalCost.toFixed(1)}${delta}`;
+/** 现状基线：所有试算都拿它作对照，成本列才能读成“比现在省多少”。 */
+const hypopgBaseCost = computed(() => hypopg.value?.baseCost ?? hypopg.value?.trials?.find((trial) => trial.baseCost !== undefined)?.baseCost);
+
+const hypopgBaseElapsedMs = computed(() => props.diagnosis?.metrics.elapsedMs);
+
+/** 成本最低且没有报错的试算组合；规划器成本是相对单位，只能横向比较。 */
+const hypopgBestTrial = computed<HypopgTrial | undefined>(() => pickBestHypopgTrial(hypopg.value?.trials ?? []));
+
+/** 按成本从低到高排列，最优点在第一屏；失败的试算排最后。 */
+const hypopgTrials = computed(() =>
+  [...(hypopg.value?.trials ?? [])].sort((left, right) => {
+    const leftCost = left.error || left.hypotheticalCost === undefined ? Number.POSITIVE_INFINITY : left.hypotheticalCost;
+    const rightCost = right.error || right.hypotheticalCost === undefined ? Number.POSITIVE_INFINITY : right.hypotheticalCost;
+    return leftCost - rightCost || left.candidateRefs.length - right.candidateRefs.length;
+  }),
+);
+
+const deltaText = (pct?: number) => {
+  if (pct === undefined || !Number.isFinite(pct)) return "-";
+  if (Math.abs(pct) < 0.05) return t("diagnostics.hypopgDeltaSame");
+  return pct < 0 ? t("diagnostics.hypopgDeltaLower", { value: Math.abs(pct).toFixed(1) }) : t("diagnostics.hypopgDeltaHigher", { value: pct.toFixed(1) });
 };
+
+const deltaClass = (pct?: number) => {
+  if (pct === undefined) return "text-muted-foreground";
+  if (pct < -0.05) return "font-medium text-emerald-600 dark:text-emerald-400";
+  if (pct > 0.05) return "text-amber-600 dark:text-amber-400";
+  return "text-muted-foreground";
+};
+
+/** 成本折算出的粗估耗时；没有实测基线时不显示，避免编造数字。 */
+const trialElapsed = (trial: HypopgTrial) => estimateElapsedMs(trial.hypotheticalCost, hypopgBaseCost.value, hypopgBaseElapsedMs.value);
+
+const trialElapsedText = (trial: HypopgTrial) => {
+  const elapsed = trialElapsed(trial);
+  return elapsed === undefined ? "-" : `${elapsed >= 100 ? Math.round(elapsed) : Math.round(elapsed * 10) / 10} ms`;
+};
+
+const trialTooltip = (trial: HypopgTrial) => trial.indexSqls.join("\n");
+
+/** `#编号 表 (键列) INCLUDE … WHERE …`，不用悬停也能看懂这行试算的是哪几条索引。 */
+const suggestionSummary = (suggestion: QueryIndexSuggestion) => {
+  const include = suggestion.includeColumns.length > 0 ? ` INCLUDE (${suggestion.includeColumns.join(", ")})` : "";
+  const where = suggestion.where ? ` WHERE ${suggestion.where}` : "";
+  return `${suggestion.table} (${suggestion.columns.join(", ")})${include}${where}`;
+};
+
+const trialDetail = (trial: HypopgTrial) =>
+  trial.candidateRefs
+    .map((ref) => {
+      const suggestion = props.diagnosis?.indexSuggestions[ref - 1];
+      return suggestion ? `#${ref} ${suggestionSummary(suggestion)}` : `#${ref}`;
+    })
+    .join("；");
+
+const hypopgBestText = computed(() => {
+  const best = hypopgBestTrial.value;
+  if (!best) return "";
+  return t("diagnostics.hypopgBest", { title: best.title, delta: deltaText(best.costDeltaPct), count: best.candidateRefs.length });
+});
 </script>
 
 <template>
@@ -178,6 +233,7 @@ const hypopgTrialCost = (trial: HypopgTrial) => {
         <div class="mb-1 font-medium">{{ t("diagnostics.indexSuggestions") }}</div>
         <div v-for="(suggestion, index) in diagnosis.indexSuggestions" :key="suggestion.sql + index" class="mb-1.5 rounded border p-2">
           <div class="mb-1 flex items-center gap-2 text-muted-foreground">
+            <span class="shrink-0 rounded bg-muted px-1 font-mono text-[10px] font-medium text-foreground">#{{ index + 1 }}</span>
             <span>{{ suggestion.reason }}</span>
             <span v-if="suggestion.impact !== undefined">（{{ suggestion.impact }}%）</span>
             <Button size="sm" variant="ghost" class="ml-auto h-5 px-1.5 text-[10px]" @click="copyText(suggestion.sql)"> <Copy class="mr-1 h-3 w-3" />{{ t("diagnostics.copy") }} </Button>
@@ -212,23 +268,44 @@ const hypopgTrialCost = (trial: HypopgTrial) => {
           <FlaskConical class="h-3.5 w-3.5 text-sky-600 dark:text-sky-400" />
           {{ t("diagnostics.hypopgTrialTitle") }}
           <span class="text-[10px] font-normal text-muted-foreground">hypopg {{ hypopg.extensionVersion }}</span>
+          <span class="text-[10px] font-normal text-muted-foreground">· {{ t("diagnostics.hypopgTrialCount", { count: hypopg.trials?.length ?? 0 }) }}</span>
         </div>
         <table class="w-full border-collapse">
           <thead>
             <tr class="text-left text-muted-foreground">
               <th class="border-b py-1 pr-2">{{ t("diagnostics.hypopgTrialColumn") }}</th>
               <th class="border-b py-1 pr-2">{{ t("diagnostics.hypopgVerdictColumn") }}</th>
-              <th class="border-b py-1">{{ t("diagnostics.hypopgCostColumn") }}</th>
+              <th class="border-b py-1 pr-2">{{ t("diagnostics.hypopgCostColumn") }}</th>
+              <th class="border-b py-1 pr-2">{{ t("diagnostics.hypopgDeltaColumn") }}</th>
+              <th class="border-b py-1">{{ t("diagnostics.hypopgElapsedColumn") }}</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="trial in hypopg.trials" :key="trial.id">
-              <td class="border-b py-1 pr-2">{{ trial.title }}</td>
+            <tr v-if="hypopgBaseCost !== undefined" class="text-muted-foreground">
+              <td class="border-b py-1 pr-2">{{ t("diagnostics.hypopgBaselineRow") }}</td>
+              <td class="border-b py-1 pr-2">-</td>
+              <td class="border-b py-1 pr-2">{{ formatPlanCost(hypopgBaseCost) }}</td>
+              <td class="border-b py-1 pr-2">{{ t("diagnostics.hypopgBaselineDelta") }}</td>
+              <td class="border-b py-1">{{ hypopgBaseElapsedMs !== undefined ? `${hypopgBaseElapsedMs.toFixed(1)} ms` : "-" }}</td>
+            </tr>
+            <tr v-for="trial in hypopgTrials" :key="trial.id" :class="trial.id === hypopgBestTrial?.id ? 'bg-emerald-500/5 font-medium' : ''">
+              <td class="border-b py-1 pr-2">
+                <div class="break-words font-medium" :title="trialTooltip(trial)">{{ trial.title }}</div>
+                <div class="break-words text-[10px] font-normal text-muted-foreground">{{ trialDetail(trial) }}</div>
+                <div v-if="trial.error" class="break-words text-[10px] font-normal text-destructive">{{ trial.error }}</div>
+              </td>
               <td class="border-b py-1 pr-2" :class="trial.used ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'">{{ hypopgTrialVerdict(trial) }}</td>
-              <td class="border-b py-1" :class="trial.error ? 'text-destructive' : ''">{{ hypopgTrialCost(trial) }}</td>
+              <td class="border-b py-1 pr-2 font-mono">{{ trial.error ? "-" : formatPlanCost(trial.hypotheticalCost) }}</td>
+              <td class="border-b py-1 pr-2" :class="deltaClass(trial.costDeltaPct)">{{ trial.error ? "-" : deltaText(trial.costDeltaPct) }}</td>
+              <td class="border-b py-1 text-muted-foreground">{{ trial.error ? "-" : trialElapsedText(trial) }}</td>
             </tr>
           </tbody>
         </table>
+        <div v-if="hypopgBestTrial" class="mt-1 flex items-center gap-1.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
+          <CheckCircle2 class="h-3.5 w-3.5" />
+          {{ hypopgBestText }}
+        </div>
+        <div class="mt-1 text-[10px] text-muted-foreground">{{ t("diagnostics.hypopgCostHint") }}</div>
         <div v-if="hypopg.note" class="mt-1 text-[10px] text-muted-foreground">{{ hypopg.note }}</div>
       </div>
 

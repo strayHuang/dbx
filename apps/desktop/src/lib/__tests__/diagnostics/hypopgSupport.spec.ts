@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { QueryIndexSuggestion } from "@/lib/diagnostics/queryDiagnostics";
-import { buildHypopgInstallHint, compareHypotheticalPlan, hypotheticalIndexArgument, parseHypopgProbe, parsePostgresServerProfile, planHypopgTrials, serverKeyForConnection } from "@/lib/diagnostics/hypopgSupport";
+import { buildHypopgInstallHint, compareHypotheticalPlan, estimateElapsedMs, formatPlanCost, hypotheticalIndexArgument, parseHypopgProbe, parsePostgresServerProfile, pickBestHypopgTrial, planHypopgTrials, selectHypopgCandidates, serverKeyForConnection } from "@/lib/diagnostics/hypopgSupport";
 
 const UBUNTU_PGDG = "PostgreSQL 18.3 (Ubuntu 18.3-1.pgdg24.04+1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit";
 const RHEL_PGDG = "PostgreSQL 14.5 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 11.2.1 20220127 (Red Hat 11.2.1-9), 64-bit";
@@ -148,23 +148,101 @@ function suggestion(table: string, columns: string[], includeColumns: string[] =
 }
 
 describe("planHypopgTrials", () => {
-  it("tests every suggestion together and then the leading ones individually", () => {
-    const groups = planHypopgTrials([
-      suggestion("qstest_oitw", ["itementry"], ["qty1"]),
-      suggestion("qstest_oitm", ["docentry"], ["groupcode", "style"]),
-      suggestion("qstest_oitm", ["groupcode"], ["docentry", "style"]),
-      suggestion("qstest_oitg", ["groupcode"], ["groupname"]),
-      suggestion("qstest_oitw", ["qty1"], ["itementry"]),
-    ]);
-    expect(groups.map((group) => group.id)).toEqual(["combined", "single-0", "single-1", "single-2"]);
-    expect(groups[0]?.indexSqls).toHaveLength(5);
+  const suggestions = [
+    suggestion("qstest_oitw", ["itementry"], ["qty1"]),
+    suggestion("qstest_oitm", ["docentry"], ["groupcode", "style"]),
+    suggestion("qstest_oitm", ["groupcode"], ["docentry", "style"]),
+    suggestion("qstest_oitg", ["groupcode"], ["groupname"]),
+    suggestion("qstest_oitw", ["qty1"], ["itementry"]),
+  ];
+
+  it("tests every single index, then pairs, triples and all together", () => {
+    const groups = planHypopgTrials(suggestions);
+    expect(groups[0]).toMatchObject({ id: "single-1", title: "#1", candidateRefs: [1] });
+    expect(groups.map((group) => group.id).filter((id) => id.startsWith("single-"))).toEqual(["single-1", "single-2", "single-4", "single-5", "single-3"]);
+
+    // 两张表被合成一个组合才是最优解的关键，pair-1-2 必须存在
+    const pair = groups.find((group) => group.id === "pair-1-2");
+    expect(pair?.candidateRefs).toEqual([1, 2]);
+    expect(pair?.indexSqls).toHaveLength(2);
+
+    // 全量组合覆盖所有候选（含部分索引 #5），并且按表轮转把三张表都带进来
+    const all = groups.find((group) => group.id === "all");
+    expect(all?.candidateRefs).toEqual([1, 2, 4, 5, 3]);
+    expect(all?.title).toBe("全部 5 条");
+
     // 尾部分号会破坏 hypopg 的语句解析，必须去掉。
-    expect(groups[0]?.indexSqls.every((sql) => !sql.endsWith(";"))).toBe(true);
-    expect(groups[1]?.title).toContain("qstest_oitw");
+    expect(groups.every((group) => group.indexSqls.every((sql) => !sql.endsWith(";")))).toBe(true);
+  });
+
+  it("rotates candidates per table so one busy table cannot crowd out the others", () => {
+    const many = [
+      suggestion("qstest_oitm", ["docentry"], ["groupcode"]),
+      suggestion("qstest_oitm", ["groupcode"], ["docentry"]),
+      suggestion("qstest_oitm", ["docnum"], ["style"]),
+      suggestion("qstest_oitm", ["style"], ["docnum"]),
+      suggestion("qstest_oitm", ["groupcode"]),
+      suggestion("qstest_oitm", ["docentry"]),
+      suggestion("qstest_oitw", ["itementry"], ["qty1"]),
+      suggestion("qstest_oitg", ["groupcode"], ["groupname"]),
+    ];
+    const candidates = selectHypopgCandidates(many, 4);
+    expect(candidates.map((candidate) => candidate.tableKey)).toEqual(["qstest_oitm", "qstest_oitw", "qstest_oitg", "qstest_oitm"]);
+    expect(candidates.map((candidate) => candidate.ref)).toEqual([1, 7, 8, 2]);
+  });
+
+  it("keeps partial indexes ahead inside the same table", () => {
+    const withPartial: QueryIndexSuggestion[] = [suggestion("qstest_oitw", ["itementry"], ["qty1"]), { ...suggestion("qstest_oitw", ["itementry"], ["qty1"]), where: `"qty1" <> '0'` }];
+    const candidates = selectHypopgCandidates(withPartial, 1);
+    expect(candidates[0]?.ref).toBe(2);
+    expect(candidates[0]?.suggestion.where).toBe(`"qty1" <> '0'`);
   });
 
   it("returns nothing when there is no suggestion", () => {
     expect(planHypopgTrials([])).toEqual([]);
+  });
+});
+
+describe("formatPlanCost", () => {
+  it("adds thousands separators so large planner costs are readable", () => {
+    expect(formatPlanCost(107703)).toBe("107,703.0");
+    expect(formatPlanCost(2410.25)).toBe("2,410.3");
+    expect(formatPlanCost(undefined)).toBe("—");
+  });
+});
+
+describe("pickBestHypopgTrial", () => {
+  it("prefers the cheapest trial, but picks fewer indexes when costs are within 2%", () => {
+    const trials = [
+      { id: "single-1", hypotheticalCost: 1200, candidateRefs: [1] },
+      { id: "pair-1-2", hypotheticalCost: 900, candidateRefs: [1, 2] },
+      { id: "all", hypotheticalCost: 890, candidateRefs: [1, 2, 3, 4] },
+    ];
+    expect(pickBestHypopgTrial(trials)?.id).toBe("pair-1-2");
+  });
+
+  it("keeps the cheaper combination when the gap is meaningful", () => {
+    const trials = [
+      { id: "pair-1-2", hypotheticalCost: 900, candidateRefs: [1, 2] },
+      { id: "all", hypotheticalCost: 700, candidateRefs: [1, 2, 3, 4] },
+    ];
+    expect(pickBestHypopgTrial(trials)?.id).toBe("all");
+  });
+
+  it("ignores failed trials without a cost", () => {
+    expect(pickBestHypopgTrial([{ id: "pair", candidateRefs: [1, 2], error: "boom" }])).toBeUndefined();
+  });
+});
+
+describe("estimateElapsedMs", () => {
+  it("scales the measured runtime by the planner-cost ratio", () => {
+    expect(estimateElapsedMs(2410.25, 51234.5, 636.1)).toBeCloseTo(29.93, 1);
+  });
+
+  it("gives up when there is no measured baseline", () => {
+    expect(estimateElapsedMs(2410.25, 51234.5, undefined)).toBeUndefined();
+    expect(estimateElapsedMs(2410.25, 0, 636.1)).toBeUndefined();
+    expect(estimateElapsedMs(undefined, 51234.5, 636.1)).toBeUndefined();
   });
 });
 

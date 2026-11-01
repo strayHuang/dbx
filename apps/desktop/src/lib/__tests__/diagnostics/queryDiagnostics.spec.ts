@@ -214,13 +214,19 @@ group by shpentry`;
     // groupname belongs to qstest_oitg and style to qstest_oitm; neither may leak
     // into the qstest_oitw suggestion.
     const oitw = forTable("qstest_oitw");
-    expect(oitw).toHaveLength(2);
+    expect(oitw).toHaveLength(3);
     expect(oitw[0]!.columns).toEqual(["qty1", "itementry"]);
     expect(oitw[0]!.includeColumns).toEqual([]);
     // The join key also stands alone so the other table can probe it.
     expect(oitw[1]!.columns).toEqual(["itementry"]);
     expect(oitw[1]!.includeColumns).toEqual(["qty1"]);
     expect(oitw[1]!.reason).toContain("连接列作键列");
+    // `qty1 != '0'` 是单表常量谓词，写进部分索引的 WHERE 后只索引命中的行。
+    expect(oitw[2]!.where).toBe("qty1 != '0'");
+    expect(oitw[2]!.columns).toEqual(["itementry"]);
+    expect(oitw[2]!.includeColumns).toEqual(["qty1"]);
+    expect(oitw[2]!.sql).toContain("INCLUDE (qty1) WHERE qty1 != '0';");
+    expect(oitw[2]!.reason).toContain("部分索引");
 
     const oitm = forTable("qstest_oitm");
     expect(oitm).toHaveLength(2);
@@ -266,19 +272,24 @@ group by shpentry`;
     expect(oitmFinding.suggestion).toContain("嵌套循环");
 
     const oitwFinding = scanFindings.find((finding) => finding.detail.includes("qstest_oitw"))!;
-    // The filter and the join key share one index; the join key also gets its own.
+    // The filter and the join key share one index; the join key also gets its own,
+    // plus a partial index that only indexes rows with qty1 <> '0'.
     expect(oitwFinding.suggestion).toContain("(qty1, itementry)");
     expect(oitwFinding.suggestion).toContain("(itementry) INCLUDE (qty1)");
+    expect(oitwFinding.suggestion).toContain("WHERE qty1 != '0'");
 
     // Plan hints win over the SQL pass when they describe the same column set,
-    // so the duplicated SQL suggestions are dropped: 2 + 2 + 1 = 5.
-    expect(diagnosis.indexSuggestions).toHaveLength(5);
+    // so the duplicated SQL suggestions are dropped: 3 + 2 + 1 = 6.
+    expect(diagnosis.indexSuggestions).toHaveLength(6);
     const oitwIndexes = diagnosis.indexSuggestions.filter((entry) => entry.table === "public.qstest_oitw");
-    expect(oitwIndexes).toHaveLength(2);
+    expect(oitwIndexes).toHaveLength(3);
     expect(oitwIndexes[0]!.columns).toEqual(["qty1", "itementry"]);
     expect(oitwIndexes[0]!.includeColumns).toEqual([]);
     expect(oitwIndexes[1]!.columns).toEqual(["itementry"]);
     expect(oitwIndexes[1]!.includeColumns).toEqual(["qty1"]);
+    // 部分索引：索引体积和扫描量都按谓词命中率缩小，和覆盖索引组合后常能出最优计划。
+    expect(oitwIndexes[2]!.where).toBe("qty1 != '0'");
+    expect(oitwIndexes[2]!.sql).toContain("WHERE qty1 != '0';");
 
     const oitmIndexes = diagnosis.indexSuggestions.filter((entry) => entry.table === "public.qstest_oitm");
     expect(oitmIndexes).toHaveLength(2);

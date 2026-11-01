@@ -68,6 +68,8 @@ export interface HypopgPlanComparison {
 export interface HypopgTrial {
   id: string;
   title: string;
+  /** 1-based positions in the suggestion list this trial covers (`[1, 3]` → `#1 + #3`). */
+  candidateRefs: number[];
   indexSqls: string[];
   indexNames: string[];
   used: boolean;
@@ -89,6 +91,8 @@ export interface HypopgAnalysis {
   profile?: PostgresServerProfile;
   installHint?: HypopgInstallHint;
   trials?: HypopgTrial[];
+  /** 实际执行计划的规划器总成本，作为所有试算的“现状”基线。 */
+  baseCost?: number;
   /** Short human readable status, appended to the diagnosis panel. */
   note?: string;
   error?: string;
@@ -111,7 +115,11 @@ export const HYPOPG_RESET_SQL = "SELECT hypopg_reset()";
 export const HYPOPG_DOCS_URL = "https://hypopg.readthedocs.io";
 
 /** One trial tests at most this many hypothetical indexes together. */
-export const HYPOPG_MAX_TRIAL_INDEXES = 6;
+export const HYPOPG_MAX_TRIAL_INDEXES = 8;
+
+/** 组合试算的规模上限：单条全部测，两两与三连只取最有代表性的前若干组。 */
+const HYPOPG_MAX_PAIR_TRIALS = 12;
+const HYPOPG_MAX_TRIPLE_TRIALS = 8;
 
 /** Identity of the PostgreSQL host, so “永不安装” is remembered per server, not per connection/database. */
 export function serverKeyForConnection(connection: { id: string; host?: string; port?: number | string }): string {
@@ -334,33 +342,160 @@ export function compareHypotheticalPlan(baseRaw: unknown, hypotheticalRaw: unkno
   return { baseCost, hypotheticalCost, costDeltaPct, used: usedIndexNames.length > 0, usedIndexNames, accessNodeTypes };
 }
 
-/**
- * Trial plan: first every suggestion together (one index set can be better than
- * any single index), then the leading suggestions individually so the user can
- * tell which one the planner actually wants.
- */
-export function planHypopgTrials(suggestions: readonly QueryIndexSuggestion[]): { id: string; title: string; indexSqls: string[] }[] {
-  const normalized = suggestions.map((suggestion) => ({ suggestion, sql: suggestion.sql.trim().replace(/;+\s*$/, "") })).filter((entry) => entry.sql.length > 0);
-  if (normalized.length === 0) return [];
+export interface HypopgTrialGroup {
+  id: string;
+  title: string;
+  indexSqls: string[];
+  /** 1-based positions in the suggestion list, so the panel can render `#1 + #3`. */
+  candidateRefs: number[];
+}
 
-  const groups: { id: string; title: string; indexSqls: string[] }[] = [];
-  const combined = normalized.slice(0, HYPOPG_MAX_TRIAL_INDEXES);
-  groups.push({
-    id: "combined",
-    title: `组合试算：${combined.length} 条建议同时生效`,
-    indexSqls: combined.map((entry) => entry.sql),
+interface HypopgCandidate {
+  /** 1-based position in the original suggestion list. */
+  ref: number;
+  tableKey: string;
+  sql: string;
+  suggestion: QueryIndexSuggestion;
+}
+
+/** `public.qstest_oitm` / `qstest_oitm` → `qstest_oitm`，用于按表分组。 */
+function tableKeyOf(table: string): string {
+  return (table.toLowerCase().split(".").pop() ?? "").trim();
+}
+
+/**
+ * 选出参与试算的候选索引，按表轮转。
+ *
+ * 老实现只取前 N 条，某张表建议多时会把别的表挤出候选，导致“部分索引 + 覆盖索引”
+ * 这类跨表最优组合根本没进过试算。轮转保证每张表至少拿到一条，部分索引在同表内
+ * 排最前（它是最容易和覆盖索引组合出最优计划的候选）。
+ */
+export function selectHypopgCandidates(suggestions: readonly QueryIndexSuggestion[], max = HYPOPG_MAX_TRIAL_INDEXES): HypopgCandidate[] {
+  const buckets = new Map<string, HypopgCandidate[]>();
+  suggestions.forEach((suggestion, index) => {
+    const sql = suggestion.sql.trim().replace(/;+\s*$/, "");
+    if (!sql) return;
+    const candidate: HypopgCandidate = { ref: index + 1, tableKey: tableKeyOf(suggestion.table), sql, suggestion };
+    const bucket = buckets.get(candidate.tableKey);
+    if (bucket) bucket.push(candidate);
+    else buckets.set(candidate.tableKey, [candidate]);
   });
 
-  for (const [index, entry] of normalized.slice(0, 3).entries()) {
-    const columns = entry.suggestion.columns.join(", ");
-    const include = entry.suggestion.includeColumns.length > 0 ? ` INCLUDE (${entry.suggestion.includeColumns.join(", ")})` : "";
-    groups.push({
-      id: `single-${index}`,
-      title: `单独试算：${entry.suggestion.table} (${columns})${include}`,
-      indexSqls: [entry.sql],
-    });
+  // 同表内：部分索引优先，其次带 INCLUDE 的覆盖索引，其余保持原顺序。
+  const score = (candidate: HypopgCandidate) => (candidate.suggestion.where ? 0 : candidate.suggestion.includeColumns.length > 0 ? 1 : 2);
+  const ordered = [...buckets.values()].map((bucket) =>
+    bucket
+      .map((candidate, order) => ({ candidate, order }))
+      .sort((left, right) => score(left.candidate) - score(right.candidate) || left.order - right.order)
+      .map((entry) => entry.candidate),
+  );
+
+  const selected: HypopgCandidate[] = [];
+  for (let round = 0; selected.length < max; round += 1) {
+    let picked = false;
+    for (const bucket of ordered) {
+      const candidate = bucket[round];
+      if (!candidate) continue;
+      selected.push(candidate);
+      picked = true;
+      if (selected.length >= max) break;
+    }
+    if (!picked) break;
+  }
+  return selected;
+}
+
+/**
+ * 试算计划：单条全部 → 跨表两两 → 跨表三连 → 全量。
+ *
+ * 只有“组合”才可能找到最优解：两张表的索引各自最优，组合后规划器才会把
+ * Seq Scan + Hash Join 换成 Index Scan + Nested Loop。
+ */
+export function planHypopgTrials(suggestions: readonly QueryIndexSuggestion[]): HypopgTrialGroup[] {
+  const candidates = selectHypopgCandidates(suggestions);
+  if (candidates.length === 0) return [];
+
+  const groups: HypopgTrialGroup[] = [];
+  const groupOf = (id: string, refs: HypopgCandidate[], title: string): HypopgTrialGroup => ({
+    id,
+    title,
+    indexSqls: refs.map((candidate) => candidate.sql),
+    candidateRefs: refs.map((candidate) => candidate.ref),
+  });
+
+  // 单条：每条候选都单独试一次，作为“这条索引本身有没有用”的基线。
+  for (const candidate of candidates) {
+    groups.push(groupOf(`single-${candidate.ref}`, [candidate], `#${candidate.ref}`));
+  }
+
+  // 两两组合：跨表优先（两张表各自被驱动/覆盖，才可能出现 Nested Loop）。
+  const pairs: [HypopgCandidate, HypopgCandidate][] = [];
+  for (let left = 0; left < candidates.length; left += 1) {
+    for (let right = left + 1; right < candidates.length; right += 1) {
+      pairs.push([candidates[left]!, candidates[right]!]);
+    }
+  }
+  pairs.sort((left, right) => {
+    const cross = Number(left[0].tableKey === left[1].tableKey) - Number(right[0].tableKey === right[1].tableKey);
+    return cross || left[0].ref - right[0].ref || left[1].ref - right[1].ref;
+  });
+  for (const [first, second] of pairs.slice(0, HYPOPG_MAX_PAIR_TRIALS)) {
+    groups.push(groupOf(`pair-${first.ref}-${second.ref}`, [first, second], `#${first.ref} + #${second.ref}`));
+  }
+
+  // 三连：只取跨表且表各不相同的前若干组，避免同一张表堆三条索引。
+  const triples: HypopgCandidate[][] = [];
+  for (let first = 0; first < candidates.length; first += 1) {
+    for (let second = first + 1; second < candidates.length; second += 1) {
+      for (let third = second + 1; third < candidates.length; third += 1) {
+        const trio = [candidates[first]!, candidates[second]!, candidates[third]!];
+        if (new Set(trio.map((candidate) => candidate.tableKey)).size !== 3) continue;
+        triples.push(trio);
+      }
+    }
+  }
+  triples.sort((left, right) => left.reduce((sum, candidate) => sum + candidate.ref, 0) - right.reduce((sum, candidate) => sum + candidate.ref, 0));
+  for (const trio of triples.slice(0, HYPOPG_MAX_TRIPLE_TRIALS)) {
+    groups.push(groupOf(`triple-${trio.map((candidate) => candidate.ref).join("-")}`, trio, trio.map((candidate) => `#${candidate.ref}`).join(" + ")));
+  }
+
+  // 全量：所有候选同时生效，作为“能省多少”的上界。
+  if (candidates.length > 1) {
+    groups.push(groupOf("all", candidates, `全部 ${candidates.length} 条`));
   }
   return groups;
+}
+
+/** 规划器成本是相对单位（不是毫秒），展示时加千分位，方便肉眼比较大小。 */
+export function formatPlanCost(cost?: number): string {
+  if (cost === undefined || !Number.isFinite(cost)) return "—";
+  return cost.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+}
+
+/**
+ * 在成本相差不到 2% 的试算里挑索引最少的那个。
+ *
+ * 多建一条索引就多一份写入、膨胀和维护成本，所以“全量组合”只比“两两组合”
+ * 便宜一点点时，应推荐两两组合。
+ */
+export function pickBestHypopgTrial<T extends { hypotheticalCost?: number; candidateRefs: readonly number[]; error?: string }>(trials: readonly T[]): T | undefined {
+  const usable = trials.filter((trial) => !trial.error && typeof trial.hypotheticalCost === "number" && Number.isFinite(trial.hypotheticalCost));
+  if (usable.length === 0) return undefined;
+  const cheapest = Math.min(...usable.map((trial) => trial.hypotheticalCost!));
+  return [...usable].filter((trial) => trial.hypotheticalCost! <= cheapest * 1.02).sort((left, right) => left.candidateRefs.length - right.candidateRefs.length || left.hypotheticalCost! - right.hypotheticalCost!)[0];
+}
+
+/**
+ * 按“成本比例”把实测耗时线性折算成粗估耗时。
+ *
+ * 规划器成本与实际耗时不成严格正比（读缓存、并行度、函数调用都会影响），
+ * 所以只用于给数量级感受，面板必须明确标注“粗估”。
+ */
+export function estimateElapsedMs(hypotheticalCost?: number, baseCost?: number, baseElapsedMs?: number): number | undefined {
+  if (hypotheticalCost === undefined || baseCost === undefined || baseElapsedMs === undefined) return undefined;
+  if (!Number.isFinite(hypotheticalCost) || !Number.isFinite(baseCost) || !Number.isFinite(baseElapsedMs)) return undefined;
+  if (baseCost <= 0 || baseElapsedMs <= 0) return undefined;
+  return (baseElapsedMs * hypotheticalCost) / baseCost;
 }
 
 /** Dollar-quoted argument for `hypopg_create_index`. */

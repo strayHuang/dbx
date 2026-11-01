@@ -17,6 +17,8 @@ export interface QueryIndexSuggestion {
   includeColumns: string[];
   /** SQL Server MissingIndexes impact percentage (0-100). */
   impact?: number;
+  /** Partial index predicate (`WHERE …`), PostgreSQL only. */
+  where?: string;
   sql: string;
   reason: string;
 }
@@ -537,7 +539,7 @@ function mergeIndexSuggestions(planSuggestions: QueryIndexSuggestion[], sqlSugge
   const seenKeys = new Set<string>();
   const planColumnSets = new Set<string>();
   const merged: QueryIndexSuggestion[] = [];
-  const keyOf = (suggestion: QueryIndexSuggestion) => `${canonicalTable(suggestion.table)}\0${suggestion.columns.map((column) => column.toLowerCase()).join(",")}`;
+  const keyOf = (suggestion: QueryIndexSuggestion) => `${canonicalTable(suggestion.table)}\0${suggestion.columns.map((column) => column.toLowerCase()).join(",")}\0${suggestion.where?.toLowerCase() ?? ""}`;
   // Key ∪ INCLUDE. A plan hint and a SQL hint carrying the same columns describe
   // the same physical index; the plan version wins because it already reflects
   // the access path the optimizer chose. Only plan suggestions are registered
@@ -546,7 +548,7 @@ function mergeIndexSuggestions(planSuggestions: QueryIndexSuggestion[], sqlSugge
     `${canonicalTable(suggestion.table)}\0${[...suggestion.columns, ...suggestion.includeColumns]
       .map((column) => column.toLowerCase())
       .sort()
-      .join(",")}`;
+      .join(",")}\0${suggestion.where?.toLowerCase() ?? ""}`;
 
   for (const suggestion of planSuggestions) {
     const key = keyOf(suggestion);
@@ -732,6 +734,14 @@ const NON_COLUMN_WORDS = new Set([
   "filter",
 ]);
 
+/** `alias.col <op> 常量` —— 单表谓词，可以直接写进部分索引的 WHERE。 */
+export interface AliasPredicateLiteral {
+  column: string;
+  operator: string;
+  /** Literal exactly as written in the SQL (`'0'`, `0`, `true`). */
+  operand: string;
+}
+
 /** Column roles an alias plays in the query text. */
 export interface AliasColumnUsage {
   /** `col = value`, `col <> value`, `col IN (…)` — the leading key columns. */
@@ -742,6 +752,8 @@ export interface AliasColumnUsage {
   join: string[];
   /** SELECT list / GROUP BY / aggregate inputs — INCLUDE candidates. */
   output: string[];
+  /** Constant predicates on this alias, reusable as a partial-index WHERE. */
+  predicates?: AliasPredicateLiteral[];
 }
 
 export interface SqlColumnFacts {
@@ -758,9 +770,30 @@ function stripSqlNoise(sql: string): string {
     .replace(/'(?:''|[^'])*'/g, "''");
 }
 
+/**
+ * Blanks comments and the *inside* of string literals while keeping every offset
+ * in place, so a match found here can be read back verbatim from the original SQL.
+ */
+function maskSqlKeepingOffsets(sql: string): string {
+  return sql
+    .replace(/--[^\n]*/g, (match) => " ".repeat(match.length))
+    .replace(/\/\*[\s\S]*?\*\//g, (match) => " ".repeat(match.length))
+    .replace(/'(?:''|[^'])*'/g, (match) => `'${" ".repeat(Math.max(0, match.length - 2))}'`);
+}
+
+/** `alias.column <op> 常量` — the constant is required, so the predicate is single-table. */
+const LITERAL_PREDICATE = /([A-Za-z_][\w$]*)\s*\.\s*([A-Za-z_][\w$]*)\s*(<>|!=|>=|<=|=|>|<)\s*('(?:''|[^'])*'|-?\d+(?:\.\d+)?|\b(?:true|false|null)\b)/gi;
+
 function addUnique(list: string[], value: string): void {
   const normalized = value.toLowerCase();
   if (!list.some((existing) => existing.toLowerCase() === normalized)) list.push(value);
+}
+
+function addPredicate(bucket: AliasColumnUsage, predicate: AliasPredicateLiteral): void {
+  const key = `${predicate.column.toLowerCase()}\0${predicate.operator}\0${predicate.operand}`;
+  const predicates = (bucket.predicates ??= []);
+  if (predicates.some((entry) => `${entry.column.toLowerCase()}\0${entry.operator}\0${entry.operand}` === key)) return;
+  predicates.push(predicate);
 }
 
 function uniqueColumns(columns: readonly string[]): string[] {
@@ -837,6 +870,19 @@ export function deriveSqlColumnFacts(sql: string): SqlColumnFacts {
     }
   }
 
+  // `alias.col <op> 常量` 是单表谓词，可以原样写进部分索引的 WHERE：
+  // 只索引命中的行，索引体积和扫描量都按谓词命中率缩小。
+  const masked = maskSqlKeepingOffsets(sql);
+  for (const match of masked.matchAll(LITERAL_PREDICATE)) {
+    const aliasKey = match[1]!.toLowerCase();
+    if (!aliasSet.has(aliasKey)) continue;
+    const operandLength = match[4]!.length;
+    const operandStart = (match.index ?? 0) + match[0].length - operandLength;
+    const operand = sql.slice(operandStart, operandStart + operandLength).trim();
+    if (!operand) continue;
+    addPredicate(usageFor(aliasKey), { column: match[2]!, operator: match[3]!, operand });
+  }
+
   // `JOIN … USING (a, b)` and `NATURAL JOIN` write no `alias.column` reference, so
   // the scan above cannot see those join keys. Pair every USING clause with the
   // join target declared right before it and the relation on the other side.
@@ -905,6 +951,7 @@ function usageForRelation(facts: SqlColumnFacts | undefined, relation: string): 
     for (const role of ["equality", "range", "join", "output"] as const) {
       for (const column of usage[role]) addUnique(merged[role], column);
     }
+    for (const predicate of usage.predicates ?? []) addPredicate(merged, predicate);
   }
   return matched ? merged : undefined;
 }
@@ -932,13 +979,14 @@ interface ScanIndexHintInput {
   loops?: number;
 }
 
-type IndexSuggestionVariant = "equality-first" | "range-first" | "scan-hint" | "join-first";
+type IndexSuggestionVariant = "equality-first" | "range-first" | "scan-hint" | "join-first" | "partial";
 
 const INDEX_VARIANT_REASON: Record<IndexSuggestionVariant, string> = {
   "equality-first": "来自 SQL 谓词与输出列推导（等值列在前、范围列在后，输出列放 INCLUDE）",
   "range-first": "对照方案：范围列在前（部分优化器在范围选择性更高时更优），输出列放 INCLUDE",
   "scan-hint": "来自执行计划中的顺序扫描：过滤列作键、连接列紧随其后，其余列放 INCLUDE",
   "join-first": "连接列作键列：本表被其他表驱动时，嵌套循环可按连接键直接定位行",
+  partial: "部分索引：把 WHERE 谓词写进索引定义，只索引命中的行（索引更小、扫描更少），常与连接/覆盖索引组合使用",
 };
 
 interface TableIndexInput {
@@ -949,14 +997,17 @@ interface TableIndexInput {
   range: string[];
   join: string[];
   output: string[];
+  /** `alias.col <op> 常量` predicates, used to build a partial-index variant. */
+  predicates?: AliasPredicateLiteral[];
   /** Variant used by the filter-leading suggestion. */
   variant: IndexSuggestionVariant;
 }
 
-/** `(a, b) INCLUDE (c)` — only the key/INCLUDE part, for prose. */
+/** `(a, b) INCLUDE (c) WHERE …` — only the key/INCLUDE/partial part, for prose. */
 function summarizeIndex(suggestion: QueryIndexSuggestion): string {
   const include = suggestion.includeColumns.length > 0 ? ` INCLUDE (${suggestion.includeColumns.join(", ")})` : "";
-  return `(${suggestion.columns.join(", ")})${include}`;
+  const where = suggestion.where ? ` WHERE ${suggestion.where}` : "";
+  return `(${suggestion.columns.join(", ")})${include}${where}`;
 }
 
 /**
@@ -995,6 +1046,26 @@ function buildTableIndexSuggestions(input: TableIndexInput): QueryIndexSuggestio
   // Keep the range-first comparison plan when there is no join to weigh in.
   if (join.length === 0 && equality.length > 0 && range.length > 0) push([...range, ...equality], "range-first");
 
+  // 部分索引：谓词命中率低的查询，把谓词写进索引定义能直接砍掉索引体积和扫描量，
+  // 常与其它表的覆盖索引组合出最优计划。只对 PostgreSQL 生成（L2 的 hypopg 试算只跑在 PG 上）。
+  const predicates = (input.predicates ?? []).filter((predicate) => predicate.operand.length > 0);
+  if (input.databaseType === "postgres" && predicates.length > 0) {
+    const predicateColumns = uniqueColumns(predicates.map((predicate) => predicate.column));
+    const isPredicateColumn = (column: string) => predicateColumns.some((entry) => entry.toLowerCase() === column.toLowerCase());
+    const otherKeys = uniqueColumns([...join, ...filters.filter((column) => !isPredicateColumn(column))]).slice(0, 4);
+    // 没有别的过滤/连接列时，只能拿谓词列本身作键。
+    const keyColumns = otherKeys.length > 0 ? otherKeys : predicateColumns.slice(0, 1);
+    const includeColumns = uniqueColumns([...referenced, ...predicateColumns])
+      .filter((column) => !keyColumns.some((key) => key.toLowerCase() === column.toLowerCase()))
+      .slice(0, 6);
+    const where = predicates.map((predicate) => `${quoteIdentifier(predicate.column)} ${predicate.operator} ${predicate.operand}`).join(" AND ");
+    const dedupe = `partial:${keyColumns.map((column) => column.toLowerCase()).join(",")}:${where}`;
+    if (!seen.has(dedupe)) {
+      seen.add(dedupe);
+      suggestions.push(buildIndexSuggestionSql(input.table, keyColumns, includeColumns, input.databaseType, "partial", undefined, where));
+    }
+  }
+
   return suggestions;
 }
 
@@ -1017,7 +1088,7 @@ function buildScanIndexHint(input: ScanIndexHintInput): { text: string; indexes:
   const workers = input.loops && input.loops > 1 ? `（${input.loops} 个并行进程）` : "";
   const scope = `本次扫描约 ${formatCount(input.totalRows)}行${workers}${input.removedRows && input.removedRows >= 1000 ? `（过滤掉 ${formatCount(input.removedRows)}行）` : ""}${input.readBlocks ? `，读取 ${formatCount(input.readBlocks)}个块` : ""}`;
 
-  const indexes = buildTableIndexSuggestions({ databaseType: input.databaseType, table: input.table, equality, range, join, output, variant: "scan-hint" });
+  const indexes = buildTableIndexSuggestions({ databaseType: input.databaseType, table: input.table, equality, range, join, output, predicates: usage?.predicates, variant: "scan-hint" });
   if (indexes.length === 0) {
     return { text: `未从 SQL 中解析出 ${input.table} 的过滤/连接列，请补全 WHERE/JOIN 谓词后再评估索引；${scope}。`, indexes };
   }
@@ -1064,6 +1135,7 @@ export function buildIndexSuggestionsFromSql(sql: string, databaseType: string):
         range: usage.range,
         join: usage.join,
         output: usage.output,
+        predicates: usage.predicates,
         variant: "equality-first",
       }),
     );
@@ -1071,7 +1143,7 @@ export function buildIndexSuggestionsFromSql(sql: string, databaseType: string):
   return suggestions;
 }
 
-function buildIndexSuggestionSql(table: string, columns: string[], includeColumns: string[], databaseType: string, variant: IndexSuggestionVariant = "equality-first", reason?: string): QueryIndexSuggestion {
+function buildIndexSuggestionSql(table: string, columns: string[], includeColumns: string[], databaseType: string, variant: IndexSuggestionVariant = "equality-first", reason?: string, whereClause?: string): QueryIndexSuggestion {
   const [schema, name] = table.includes(".") ? (table.split(".") as [string, string]) : [undefined, table];
   const why = reason ?? INDEX_VARIANT_REASON[variant];
   if (databaseType === "sqlserver") {
@@ -1089,11 +1161,13 @@ function buildIndexSuggestionSql(table: string, columns: string[], includeColumn
   }
   const quotedTable = schema ? `${quoteIdentifier(schema)}.${quoteIdentifier(name)}` : quoteIdentifier(name);
   const includeClause = includeColumns.length > 0 ? ` INCLUDE (${includeColumns.map((column) => quoteIdentifier(column)).join(", ")})` : "";
+  const wherePart = whereClause ? ` WHERE ${whereClause}` : "";
   return {
     table: schema ? `${schema}.${name}` : name,
     columns,
     includeColumns,
-    sql: `CREATE INDEX ON ${quotedTable} (${columns.map((column) => quoteIdentifier(column)).join(", ")})${includeClause};`,
+    ...(whereClause ? { where: whereClause } : {}),
+    sql: `CREATE INDEX ON ${quotedTable} (${columns.map((column) => quoteIdentifier(column)).join(", ")})${includeClause}${wherePart};`,
     reason: why,
   };
 }
