@@ -956,6 +956,12 @@ export interface RememberedConnectionDatabase {
   dbType: string;
 }
 
+/**
+ * 用户对「服务器未安装 hypopg」提示的决策。
+ * `later` 表示这次先跳过（下次诊断仍会提示），`never` 表示该服务器永久不再提示。
+ */
+export type HypopgInstallDecision = "later" | "never";
+
 export type SnippetTriggerKey = "tab" | "space" | "both";
 
 export type WebLogoPosition = "left" | "right" | "hidden";
@@ -1167,6 +1173,8 @@ export interface EditorSettings {
   rememberConnectionDatabaseOnDelete: boolean;
   /** 已记住的「连接名 → { 数据库名, 数据库类型 }」映射，用于新建同名连接时自动选中数据库。 */
   rememberedConnectionDatabases: Record<string, RememberedConnectionDatabase>;
+  /** hypopg 安装提示的用户决策，按服务器身份（`host:port`）记录，`never` 时不提示。 */
+  hypopgInstallDecisions: Record<string, HypopgInstallDecision>;
   dataTabReuseMode: DataTabReuseMode;
   openDataTabsNextToActive: boolean;
   prefillNewQueryWithSelect: boolean;
@@ -1516,6 +1524,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   deleteConnectionTabHandlingMode: "close-tabs",
   rememberConnectionDatabaseOnDelete: true,
   rememberedConnectionDatabases: {},
+  hypopgInstallDecisions: {},
   dataTabReuseMode: DEFAULT_DATA_TAB_REUSE_MODE,
   openDataTabsNextToActive: false,
   prefillNewQueryWithSelect: true,
@@ -1790,6 +1799,21 @@ function normalizeRememberedConnectionDatabases(value: unknown): Record<string, 
   if (entries.length <= REMEMBERED_CONNECTION_DATABASES_LIMIT) return Object.fromEntries(entries);
   // 超出上限时保留最后写入的部分（对象插入顺序即写入顺序）。
   return Object.fromEntries(entries.slice(entries.length - REMEMBERED_CONNECTION_DATABASES_LIMIT));
+}
+
+/** hypopg 提示决策最多记录的服务器数量；超出后丢弃最早写入的条目。 */
+const HYPOPG_INSTALL_DECISIONS_LIMIT = 100;
+
+function normalizeHypopgInstallDecisions(value: unknown): Record<string, HypopgInstallDecision> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const entries: [string, HypopgInstallDecision][] = [];
+  for (const [serverKey, decision] of Object.entries(value as Record<string, unknown>)) {
+    const key = serverKey.trim();
+    if (!key || (decision !== "later" && decision !== "never")) continue;
+    entries.push([key, decision]);
+  }
+  if (entries.length <= HYPOPG_INSTALL_DECISIONS_LIMIT) return Object.fromEntries(entries);
+  return Object.fromEntries(entries.slice(entries.length - HYPOPG_INSTALL_DECISIONS_LIMIT));
 }
 
 function normalizeClickTableNavigationTarget(value: unknown): ClickTableNavigationTarget {
@@ -2207,6 +2231,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     deleteConnectionTabHandlingMode: normalizeDeleteConnectionTabHandlingMode(settings.deleteConnectionTabHandlingMode),
     rememberConnectionDatabaseOnDelete: typeof settings.rememberConnectionDatabaseOnDelete === "boolean" ? settings.rememberConnectionDatabaseOnDelete : DEFAULT_EDITOR_SETTINGS.rememberConnectionDatabaseOnDelete,
     rememberedConnectionDatabases: normalizeRememberedConnectionDatabases(settings.rememberedConnectionDatabases),
+    hypopgInstallDecisions: normalizeHypopgInstallDecisions(settings.hypopgInstallDecisions),
     dataTabReuseMode: normalizeDataTabReuseMode(
       settings.dataTabReuseMode,
       (
@@ -3113,6 +3138,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.deleteConnectionTabHandlingMode !== undefined) editorSettings.value.deleteConnectionTabHandlingMode = normalizeDeleteConnectionTabHandlingMode(partial.deleteConnectionTabHandlingMode);
     if (partial.rememberConnectionDatabaseOnDelete !== undefined) editorSettings.value.rememberConnectionDatabaseOnDelete = partial.rememberConnectionDatabaseOnDelete === true;
     if (partial.rememberedConnectionDatabases !== undefined) editorSettings.value.rememberedConnectionDatabases = normalizeRememberedConnectionDatabases(partial.rememberedConnectionDatabases);
+    if (partial.hypopgInstallDecisions !== undefined) editorSettings.value.hypopgInstallDecisions = normalizeHypopgInstallDecisions(partial.hypopgInstallDecisions);
     if (partial.dataTabReuseMode !== undefined) editorSettings.value.dataTabReuseMode = normalizeDataTabReuseMode(partial.dataTabReuseMode);
     if (partial.openDataTabsNextToActive !== undefined) editorSettings.value.openDataTabsNextToActive = partial.openDataTabsNextToActive === true;
     if (partial.prefillNewQueryWithSelect !== undefined) editorSettings.value.prefillNewQueryWithSelect = partial.prefillNewQueryWithSelect;
@@ -3279,6 +3305,31 @@ export const useSettingsStore = defineStore("settings", () => {
     updateEditorSettings({ rememberedConnectionDatabases: {} });
   }
 
+  /**
+   * 记录用户对 hypopg 安装提示的决策。
+   * `never` 会让该服务器（host:port）以后不再出现安装提示；`later` 仍会在下次诊断时提示。
+   */
+  function rememberHypopgInstallDecision(serverKey: string, decision: HypopgInstallDecision) {
+    const key = serverKey.trim();
+    if (!key) return;
+    const current = editorSettings.value.hypopgInstallDecisions;
+    if (current[key] === decision) return;
+    const next = { ...current };
+    // 重新插入以刷新写入顺序，让上限裁剪优先淘汰最旧的条目。
+    delete next[key];
+    next[key] = decision;
+    updateEditorSettings({ hypopgInstallDecisions: next });
+  }
+
+  function forgetHypopgInstallDecision(serverKey: string) {
+    const key = serverKey.trim();
+    const current = editorSettings.value.hypopgInstallDecisions;
+    if (!key || !(key in current)) return;
+    const next = { ...current };
+    delete next[key];
+    updateEditorSettings({ hypopgInstallDecisions: next });
+  }
+
   function updateColumnFormatter(key: string, formatter: ColumnFormatterConfig | undefined) {
     const columnFormatters = { ...editorSettings.value.columnFormatters };
     const normalized = normalizeColumnFormatter(formatter);
@@ -3439,6 +3490,8 @@ export const useSettingsStore = defineStore("settings", () => {
     rememberConnectionDatabases,
     rememberedDatabaseForConnection,
     clearRememberedConnectionDatabases,
+    rememberHypopgInstallDecision,
+    forgetHypopgInstallDecision,
     customColumnFormatterDeleteVersion,
     upsertCustomColumnFormatter,
     deleteCustomColumnFormatter,

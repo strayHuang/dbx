@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, CheckCircle2, Copy, Gauge, Info, Loader2, RefreshCw, Snowflake, Sun } from "@lucide/vue";
+import { AlertTriangle, Ban, CheckCircle2, Clock, Copy, FlaskConical, Gauge, Info, Loader2, Package, RefreshCw, Snowflake, Sun } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import { useSettingsStore } from "@/stores/settingsStore";
 import type { QueryDiagnosis, QueryDiagnosticFinding } from "@/lib/diagnostics/queryDiagnostics";
+import type { HypopgTrial } from "@/lib/diagnostics/hypopgSupport";
 
 const props = withDefaults(
   defineProps<{
@@ -19,6 +21,7 @@ const props = withDefaults(
 const emit = defineEmits<{ diagnose: [] }>();
 
 const { t } = useI18n();
+const settingsStore = useSettingsStore();
 
 const severityOrder: Record<string, number> = { critical: 0, warning: 1, info: 2 };
 
@@ -33,6 +36,63 @@ const severityClass = (severity: string) => (severity === "critical" ? "text-des
 const measuredRows = computed(() => props.diagnosis?.measured ?? []);
 
 const copyText = (value: string) => void navigator.clipboard?.writeText(value);
+
+/** 本次诊断里用户点了“稍候安装”后的临时隐藏；重新诊断会再次提示。 */
+const hypopgDismissed = ref(false);
+watch(
+  () => props.diagnosis,
+  () => {
+    hypopgDismissed.value = false;
+  },
+);
+
+const hypopg = computed(() => props.diagnosis?.hypopg);
+
+/** 服务器没装 hypopg：展示安装命令与“稍候 / 永不安装”。 */
+const showHypopgSetup = computed(() => {
+  const info = hypopg.value;
+  if (!info || info.promptSuppressed || hypopgDismissed.value) return false;
+  if (info.availability === "installed" || info.availability === "unknown") return false;
+  return info.installHint !== undefined;
+});
+
+/** 已装 hypopg：展示假设索引试算结果。 */
+const showHypopgTrials = computed(() => {
+  const info = hypopg.value;
+  if (!info || info.availability !== "installed" || hypopgDismissed.value) return false;
+  return (info.trials?.length ?? 0) > 0;
+});
+
+const hypopgSetupText = computed(() => {
+  const hint = hypopg.value?.installHint;
+  if (!hint) return "";
+  return [...hint.shellCommands, ...(hint.shellCommands.length > 0 ? [""] : []), ...hint.sqlStatements].join("\n");
+});
+
+/** 文件已装、只差 CREATE EXTENSION 时，标题不能写“未安装”。 */
+const hypopgSetupTitle = computed(() => (hypopg.value?.availability === "available" ? t("diagnostics.hypopgAvailableNotCreated") : t("diagnostics.hypopgMissingTitle")));
+
+const hypopgSetupDetail = computed(() => {
+  const info = hypopg.value;
+  if (!info) return "";
+  if (info.availability === "available") return info.installHint?.note ?? t("diagnostics.hypopgAvailableNotCreated");
+  return info.note ?? t("diagnostics.hypopgMissingDetail");
+});
+
+const decideHypopg = (decision: "later" | "never") => {
+  const serverKey = hypopg.value?.serverKey;
+  if (serverKey) settingsStore.rememberHypopgInstallDecision(serverKey, decision);
+  hypopgDismissed.value = true;
+};
+
+const hypopgTrialVerdict = (trial: HypopgTrial) => (trial.used ? t("diagnostics.hypopgSelected") : t("diagnostics.hypopgNotSelected"));
+
+const hypopgTrialCost = (trial: HypopgTrial) => {
+  if (trial.error) return trial.error;
+  if (trial.hypotheticalCost === undefined) return "-";
+  const delta = trial.costDeltaPct === undefined ? "" : `（${trial.costDeltaPct > 0 ? "+" : ""}${trial.costDeltaPct.toFixed(1)}%）`;
+  return `${trial.hypotheticalCost.toFixed(1)}${delta}`;
+};
 </script>
 
 <template>
@@ -129,6 +189,51 @@ const copyText = (value: string) => void navigator.clipboard?.writeText(value);
           </div>
           <pre class="overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2 font-mono text-[11px]">{{ suggestion.sql }}</pre>
         </div>
+      </div>
+
+      <div v-if="showHypopgSetup && hypopg?.installHint" class="mb-3 rounded border border-sky-500/40 bg-sky-500/5 p-2">
+        <div class="mb-1 flex items-center gap-1.5 font-medium">
+          <Package class="h-3.5 w-3.5 text-sky-600 dark:text-sky-400" />
+          {{ hypopgSetupTitle }}
+          <span v-if="hypopg.profile?.majorVersion" class="ml-auto text-[10px] font-normal text-muted-foreground">{{ hypopg.profile.distribution }} · PostgreSQL {{ hypopg.profile.majorVersion }}</span>
+        </div>
+        <div class="mb-1.5 text-muted-foreground">{{ hypopgSetupDetail }}</div>
+        <div v-if="hypopg.installHint.shellCommands.length > 0" class="mb-1 text-[10px] text-muted-foreground">{{ t("diagnostics.hypopgServerSteps") }}</div>
+        <pre v-if="hypopg.installHint.shellCommands.length > 0" class="mb-1.5 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2 font-mono text-[11px]">{{ hypopg.installHint.shellCommands.join("\n") }}</pre>
+        <div class="mb-1 text-[10px] text-muted-foreground">{{ t("diagnostics.hypopgSqlSteps") }}</div>
+        <pre class="mb-1.5 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2 font-mono text-[11px]">{{ hypopg.installHint.sqlStatements.join("\n") }}</pre>
+        <div v-if="hypopg.installHint.note" class="mb-1.5 text-[10px] text-muted-foreground">{{ hypopg.installHint.note }}</div>
+        <div class="flex flex-wrap items-center gap-1">
+          <Button size="sm" variant="secondary" class="h-6 gap-1 px-2 text-[11px]" @click="copyText(hypopgSetupText)"> <Copy class="h-3 w-3" />{{ t("diagnostics.copy") }} </Button>
+          <Button size="sm" variant="ghost" class="h-6 gap-1 px-2 text-[11px]" @click="decideHypopg('later')"> <Clock class="h-3 w-3" />{{ t("diagnostics.hypopgLater") }} </Button>
+          <Button size="sm" variant="ghost" class="h-6 gap-1 px-2 text-[11px] text-muted-foreground" @click="decideHypopg('never')"> <Ban class="h-3 w-3" />{{ t("diagnostics.hypopgNever") }} </Button>
+        </div>
+        <div class="mt-1 text-[10px] text-muted-foreground">{{ t("diagnostics.hypopgNeverHint") }}</div>
+      </div>
+
+      <div v-if="showHypopgTrials && hypopg" class="mb-3">
+        <div class="mb-1 flex items-center gap-1.5 font-medium">
+          <FlaskConical class="h-3.5 w-3.5 text-sky-600 dark:text-sky-400" />
+          {{ t("diagnostics.hypopgTrialTitle") }}
+          <span class="text-[10px] font-normal text-muted-foreground">hypopg {{ hypopg.extensionVersion }}</span>
+        </div>
+        <table class="w-full border-collapse">
+          <thead>
+            <tr class="text-left text-muted-foreground">
+              <th class="border-b py-1 pr-2">{{ t("diagnostics.hypopgTrialColumn") }}</th>
+              <th class="border-b py-1 pr-2">{{ t("diagnostics.hypopgVerdictColumn") }}</th>
+              <th class="border-b py-1">{{ t("diagnostics.hypopgCostColumn") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="trial in hypopg.trials" :key="trial.id">
+              <td class="border-b py-1 pr-2">{{ trial.title }}</td>
+              <td class="border-b py-1 pr-2" :class="trial.used ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'">{{ hypopgTrialVerdict(trial) }}</td>
+              <td class="border-b py-1" :class="trial.error ? 'text-destructive' : ''">{{ hypopgTrialCost(trial) }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="hypopg.note" class="mt-1 text-[10px] text-muted-foreground">{{ hypopg.note }}</div>
       </div>
 
       <div v-if="measuredRows.length > 1" class="mb-3">

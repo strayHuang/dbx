@@ -57,6 +57,12 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ resultTabPreferComments: "false" } as any).resultTabPreferComments).toBe(true);
   });
 
+  it("drops unknown hypopg install decisions", () => {
+    expect(normalizeEditorSettings({}).hypopgInstallDecisions).toEqual({});
+    expect(normalizeEditorSettings({ hypopgInstallDecisions: { "db:5432": "never" } }).hypopgInstallDecisions).toEqual({ "db:5432": "never" });
+    expect(normalizeEditorSettings({ hypopgInstallDecisions: { "db:5432": "sometimes" } as any }).hypopgInstallDecisions).toEqual({});
+  });
+
   it("defaults webLogoPosition to left and validates positions (#11053)", () => {
     expect(DEFAULT_EDITOR_SETTINGS.webLogoPosition).toBe("left");
     expect(normalizeEditorSettings({}).webLogoPosition).toBe("left");
@@ -2158,6 +2164,27 @@ describe("settingsStore editor settings persistence", () => {
     await store.initEditorSettings();
 
     expect(store.editorSettings.sqlFormatter.layoutStyle).toBe("classic");
+  });
+
+  it("remembers the hypopg install decision per server and forgets it on request", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({});
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    expect(store.editorSettings.hypopgInstallDecisions).toEqual({});
+
+    store.rememberHypopgInstallDecision("10.126.126.3:5432", "later");
+    await vi.waitFor(() => expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ hypopgInstallDecisions: { "10.126.126.3:5432": "later" } })));
+
+    store.rememberHypopgInstallDecision("10.126.126.3:5432", "never");
+    await vi.waitFor(() => expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ hypopgInstallDecisions: { "10.126.126.3:5432": "never" } })));
+
+    store.forgetHypopgInstallDecision("10.126.126.3:5432");
+    await vi.waitFor(() => expect(store.editorSettings.hypopgInstallDecisions).toEqual({}));
   });
 
   it("initializes legacy settings before queueing formatter mutations", async () => {

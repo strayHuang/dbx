@@ -34,7 +34,21 @@ import { orderPinnedFirst } from "@/lib/app/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
 import { isSqlErrorPositionDebugEnabled, logSqlErrorPosition, sqlErrorHasMessagePosition, sqlErrorMessageText } from "@/lib/sql/errorPosition";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, parseDb2ExplainText, sqlServerExplainResult, type BuildExplainSqlResult, type ExplainPlanDatabaseType } from "@/lib/diagram/explainPlan";
-import { buildCacheClearPlan, diagnoseQueryPlan, extractReferencedRelations, rankMeasuredCandidates, type MeasuredCandidate, type QueryDiagnosis } from "@/lib/diagnostics/queryDiagnostics";
+import { buildCacheClearPlan, diagnoseQueryPlan, extractReferencedRelations, rankMeasuredCandidates, type MeasuredCandidate, type QueryDiagnosis, type QueryIndexSuggestion } from "@/lib/diagnostics/queryDiagnostics";
+import {
+  HYPOPG_CREATE_SQL,
+  HYPOPG_PROBE_SQL,
+  HYPOPG_RESET_SQL,
+  buildHypopgInstallHint,
+  compareHypotheticalPlan,
+  hypotheticalIndexArgument,
+  parseHypopgProbe,
+  parsePostgresServerProfile,
+  planHypopgTrials,
+  serverKeyForConnection,
+  type HypopgAnalysis,
+  type HypopgTrial,
+} from "@/lib/diagnostics/hypopgSupport";
 import { mysqlExplainCompatibilityHint } from "@/lib/diagram/mysqlExplainCompatibility";
 import {
   allEditableColumnsWriteable,
@@ -188,7 +202,7 @@ const UPPERCASE_FOLDED_METADATA_TYPES = new Set<string>([...ORACLE_LIKE_METADATA
 // even though the table has one).
 const HIDDEN_QUERY_KEY_DATABASE_TYPES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "oracle", "xugu", "dameng", "highgo", "oceanbase-oracle", "db2"]);
 const QUERY_RESULT_EXPORT_UNSUPPORTED_ERROR = "Streaming export is unsupported for this query. Simplify it or use a supported driver.";
-const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export", "diagnostics"] as const;
+const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export", "diagnostics", "hypopg"] as const;
 const CANCEL_QUERY_TIMEOUT_MS = 10_000;
 const CANCEL_ACK_SETTLE_TIMEOUT_MS = 2_000;
 const QUERY_METADATA_PREFLIGHT_BUDGET_MS = 1_000;
@@ -9923,6 +9937,8 @@ export const useQueryStore = defineStore("query", () => {
       }
 
       const baseDiagnosis = diagnoseQueryPlan(baseline.plan, sql);
+      // L2：hypopg 假设索引试算。只探测/试算，不创建任何真实索引。
+      const hypopg = databaseType === "postgres" ? await analyseHypotheticalIndexes(tab, sql, baseline.plan, baseDiagnosis.indexSuggestions, queryTimeoutSecs) : undefined;
       const measured: MeasuredCandidate[] = [
         {
           candidate: { id: "original", title: t("diagnostics.originalSql"), reason: "", sql },
@@ -9944,6 +9960,7 @@ export const useQueryStore = defineStore("query", () => {
         coldStart: baseline.coldStart,
         cacheNote: cachePlan.note,
         measured,
+        hypopg,
         recommended: best ? { id: best.candidate.id, title: best.candidate.title, sql: best.candidate.sql, elapsedMs: best.elapsedMs ?? best.executionTimeMs } : undefined,
       };
       tab.diagnosis = diagnosis;
@@ -10041,6 +10058,125 @@ export const useQueryStore = defineStore("query", () => {
           console.warn("[DBX][diagnostics:sqlserver-plan-off:error]", { tabId: tab.id, error });
         }
       }
+      await closeClientSessionId(tab.connectionId, tab.database, clientSessionId, tab.catalog, { tabId: tab.id }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * PostgreSQL L2：hypopg 假设索引试算。
+   *
+   * ① 探测服务器是否装了 hypopg（`pg_extension` / `pg_available_extensions`）；
+   * ② 没装就按服务器发行版生成可复制的安装命令，并记录用户“稍候/永不安装”的决策；
+   * ③ 装了就用 `hypopg_create_index()` 建假设索引，用不带 ANALYZE 的 EXPLAIN
+   *    看规划器是否选中、估算成本如何——不产生任何真实索引。
+   *
+   * 假设索引只存在于当前后端会话，因此这里的所有语句共享同一个 `clientSessionId`，
+   * 并在结束时关闭该会话。
+   */
+  async function analyseHypotheticalIndexes(tab: QueryTab, sql: string, basePlan: import("@/lib/diagram/explainPlan").ParsedExplainPlan, suggestions: readonly QueryIndexSuggestion[], queryTimeoutSecs: number): Promise<HypopgAnalysis | undefined> {
+    if (suggestions.length === 0) return undefined;
+    const connection = useConnectionStore().getConfig(tab.connectionId);
+    const serverKey = serverKeyForConnection(connection ?? { id: tab.connectionId });
+    const decision = (settingsStore.editorSettings.hypopgInstallDecisions ?? {})[serverKey];
+    // 用户选择“永不安装”后，该服务器不再出现任何 hypopg 安装提示；
+    // 仍然探测一次，以便用户自己装好后可以立即用上试算。
+    const promptSuppressed = decision === "never";
+
+    const executionId = uuid();
+    const clientSessionId = `${tabClientSessionId(tab, "hypopg")}:${executionId}`;
+    const schema = queryExecutionSchemaForTab(tab);
+    const timeoutSecs = Math.min(Math.max(queryTimeoutSecs || 10, 10), 60);
+    const run = (statement: string) =>
+      api.executeQuery(tab.connectionId, tab.database, statement, schema, executionId, {
+        clientSessionId,
+        catalog: tab.catalog,
+        timeoutSecs,
+        executionMode: "simple",
+      });
+    const resetHypotheticalIndexes = async () => {
+      try {
+        await run(HYPOPG_RESET_SQL);
+      } catch {
+        // 会话关闭本来就会丢弃假设索引，重置失败不影响结论。
+      }
+    };
+
+    try {
+      let probe = parseHypopgProbe(await run(HYPOPG_PROBE_SQL));
+      const profile = probe.version ? parsePostgresServerProfile(probe.version) : undefined;
+      let autoCreatedVersion: string | undefined;
+      let installError: string | undefined;
+
+      // 服务器文件已装但当前库还没登记扩展：超级用户下由 DBX 直接登记。
+      if (!probe.installed && probe.available && probe.isSuperuser) {
+        try {
+          await run(`${HYPOPG_CREATE_SQL};`);
+          probe = parseHypopgProbe(await run(HYPOPG_PROBE_SQL));
+          if (probe.installed) autoCreatedVersion = probe.extensionVersion;
+        } catch (error: any) {
+          installError = String(error?.message || error);
+        }
+      }
+
+      if (!probe.installed) {
+        const baseHint = profile ? buildHypopgInstallHint(profile) : undefined;
+        return {
+          availability: probe.available ? "available" : "missing",
+          serverKey,
+          extensionVersion: probe.extensionVersion,
+          availableVersion: probe.availableVersion,
+          promptSuppressed,
+          profile,
+          // 文件已经装好、只差 CREATE EXTENSION 时不需要再给包管理器命令。
+          installHint: promptSuppressed ? undefined : probe.available && baseHint ? { ...baseHint, shellCommands: [], note: t("diagnostics.hypopgNeedSuperuser") } : baseHint,
+          note: probe.available ? t("diagnostics.hypopgAvailableNotCreated") : undefined,
+          error: installError,
+        };
+      }
+
+      const trials: HypopgTrial[] = [];
+      for (const group of planHypopgTrials(suggestions)) {
+        const indexNames: string[] = [];
+        try {
+          await resetHypotheticalIndexes();
+          for (const indexSql of group.indexSqls) {
+            const created = await run(hypotheticalIndexArgument(indexSql));
+            const name = created.rows[0]?.[0];
+            if (typeof name === "string") indexNames.push(name);
+          }
+          // 假设索引只对不带 ANALYZE 的 EXPLAIN 生效；带上 ANALYZE 会退回真实计划。
+          const explain = await run(`EXPLAIN (FORMAT JSON) ${sql.trim().replace(/;+\s*$/, "")}`);
+          const comparison = compareHypotheticalPlan(basePlan.raw, parseExplainResult("postgres", explain).raw, indexNames);
+          trials.push({
+            id: group.id,
+            title: group.title,
+            indexSqls: group.indexSqls,
+            indexNames,
+            used: comparison.used,
+            baseCost: comparison.baseCost,
+            hypotheticalCost: comparison.hypotheticalCost,
+            costDeltaPct: comparison.costDeltaPct,
+            accessNodeTypes: comparison.accessNodeTypes,
+          });
+        } catch (error: any) {
+          trials.push({ id: group.id, title: group.title, indexSqls: group.indexSqls, indexNames, used: false, error: String(error?.message || error) });
+        }
+      }
+      await resetHypotheticalIndexes();
+
+      return {
+        availability: "installed",
+        serverKey,
+        extensionVersion: probe.extensionVersion,
+        availableVersion: probe.availableVersion,
+        promptSuppressed,
+        profile,
+        trials,
+        note: autoCreatedVersion ? t("diagnostics.hypopgAutoCreated", { version: autoCreatedVersion }) : undefined,
+      };
+    } catch (error: any) {
+      return { availability: "unknown", serverKey, promptSuppressed, error: String(error?.message || error) };
+    } finally {
       await closeClientSessionId(tab.connectionId, tab.database, clientSessionId, tab.catalog, { tabId: tab.id }).catch(() => undefined);
     }
   }

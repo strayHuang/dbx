@@ -1,4 +1,5 @@
 import type { ParsedExplainPlan } from "@/lib/diagram/explainPlan";
+import type { HypopgAnalysis } from "@/lib/diagnostics/hypopgSupport";
 
 export type DiagnosticSeverity = "critical" | "warning" | "info";
 
@@ -49,9 +50,11 @@ export interface QueryDiagnosis {
   /** Measured candidates, original SQL included as the first entry. */
   measured: MeasuredCandidate[];
   recommended?: { id: string; title: string; sql: string; elapsedMs?: number };
+  /** PostgreSQL-only hypothetical-index trial (L2). Absent when the server cannot run it. */
+  hypopg?: HypopgAnalysis;
 }
 
-export type QueryDiagnosisCore = Omit<QueryDiagnosis, "coldStart" | "cacheNote" | "measured" | "recommended">;
+export type QueryDiagnosisCore = Omit<QueryDiagnosis, "coldStart" | "cacheNote" | "measured" | "recommended" | "hypopg">;
 
 /** Cache-clearing statements per database, applied before every measured run. */
 export interface CacheClearPlan {
