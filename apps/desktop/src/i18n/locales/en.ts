@@ -3811,6 +3811,7 @@ export default {
     hypopgNotSelected: "Not chosen (kept the original plan)",
     hypopgCostColumn: "Estimated cost",
     hypopgNeedSuperuser: "The hypopg files are installed but this database has not registered the extension yet. CREATE EXTENSION requires a superuser — run the SQL above as one.",
+    hypopgAvailableTitle: "hypopg files are installed but not enabled in this database",
     hypopgAvailableNotCreated: "hypopg is available on this server; waiting for the extension to be created in this database.",
     hypopgAutoCreated: "Created the hypopg extension automatically (version {version}).",
   },

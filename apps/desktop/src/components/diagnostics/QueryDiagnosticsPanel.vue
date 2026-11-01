@@ -70,14 +70,9 @@ const hypopgSetupText = computed(() => {
 });
 
 /** 文件已装、只差 CREATE EXTENSION 时，标题不能写“未安装”。 */
-const hypopgSetupTitle = computed(() => (hypopg.value?.availability === "available" ? t("diagnostics.hypopgAvailableNotCreated") : t("diagnostics.hypopgMissingTitle")));
+const hypopgSetupTitle = computed(() => (hypopg.value?.availability === "available" ? t("diagnostics.hypopgAvailableTitle") : t("diagnostics.hypopgMissingTitle")));
 
-const hypopgSetupDetail = computed(() => {
-  const info = hypopg.value;
-  if (!info) return "";
-  if (info.availability === "available") return info.installHint?.note ?? t("diagnostics.hypopgAvailableNotCreated");
-  return info.note ?? t("diagnostics.hypopgMissingDetail");
-});
+const hypopgSetupDetail = computed(() => (hypopg.value?.availability === "available" ? t("diagnostics.hypopgAvailableNotCreated") : t("diagnostics.hypopgMissingDetail")));
 
 const decideHypopg = (decision: "later" | "never") => {
   const serverKey = hypopg.value?.serverKey;
