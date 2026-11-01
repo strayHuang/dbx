@@ -72,7 +72,7 @@ const hypopgSetupText = computed(() => {
 /** 文件已装、只差 CREATE EXTENSION 时，标题不能写“未安装”。 */
 const hypopgSetupTitle = computed(() => (hypopg.value?.availability === "available" ? t("diagnostics.hypopgAvailableTitle") : t("diagnostics.hypopgMissingTitle")));
 
-const hypopgSetupDetail = computed(() => (hypopg.value?.availability === "available" ? t("diagnostics.hypopgAvailableNotCreated") : t("diagnostics.hypopgMissingDetail")));
+const hypopgSetupDetail = computed(() => hypopg.value?.note ?? (hypopg.value?.availability === "available" ? t("diagnostics.hypopgAvailableNotCreated") : t("diagnostics.hypopgMissingDetail")));
 
 const decideHypopg = (decision: "later" | "never") => {
   const serverKey = hypopg.value?.serverKey;
@@ -193,6 +193,7 @@ const hypopgTrialCost = (trial: HypopgTrial) => {
           <span v-if="hypopg.profile?.majorVersion" class="ml-auto text-[10px] font-normal text-muted-foreground">{{ hypopg.profile.distribution }} · PostgreSQL {{ hypopg.profile.majorVersion }}</span>
         </div>
         <div class="mb-1.5 text-muted-foreground">{{ hypopgSetupDetail }}</div>
+        <div v-if="hypopg.error" class="mb-1.5 break-words font-mono text-[11px] text-destructive">{{ hypopg.error }}</div>
         <div v-if="hypopg.installHint.shellCommands.length > 0" class="mb-1 text-[10px] text-muted-foreground">{{ t("diagnostics.hypopgServerSteps") }}</div>
         <pre v-if="hypopg.installHint.shellCommands.length > 0" class="mb-1.5 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2 font-mono text-[11px]">{{ hypopg.installHint.shellCommands.join("\n") }}</pre>
         <div class="mb-1 text-[10px] text-muted-foreground">{{ t("diagnostics.hypopgSqlSteps") }}</div>

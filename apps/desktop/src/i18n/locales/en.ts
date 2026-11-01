@@ -3813,6 +3813,7 @@ export default {
     hypopgNeedSuperuser: "The hypopg files are installed but this database has not registered the extension yet. CREATE EXTENSION requires a superuser — run the SQL above as one.",
     hypopgAvailableTitle: "hypopg files are installed but not enabled in this database",
     hypopgAvailableNotCreated: "hypopg is available on this server; waiting for the extension to be created in this database.",
+    hypopgCreateFailed: "Automatic CREATE EXTENSION failed (another session may hold a long transaction lock). Run the SQL above and diagnose again.",
     hypopgAutoCreated: "Created the hypopg extension automatically (version {version}).",
   },
   explain: {

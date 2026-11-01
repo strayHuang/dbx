@@ -103,6 +103,9 @@ export const HYPOPG_PROBE_SQL = `SELECT
 
 export const HYPOPG_CREATE_SQL = "CREATE EXTENSION IF NOT EXISTS hypopg";
 
+/** 创建扩展会等待 catalog 锁；限制等待时间，避免诊断被别人的长事务卡住。 */
+export const HYPOPG_LOCK_TIMEOUT_SQL = "SET lock_timeout = '5s'";
+
 export const HYPOPG_RESET_SQL = "SELECT hypopg_reset()";
 
 export const HYPOPG_DOCS_URL = "https://hypopg.readthedocs.io";

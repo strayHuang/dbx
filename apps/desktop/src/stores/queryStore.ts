@@ -37,6 +37,7 @@ import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracl
 import { buildCacheClearPlan, diagnoseQueryPlan, extractReferencedRelations, rankMeasuredCandidates, type MeasuredCandidate, type QueryDiagnosis, type QueryIndexSuggestion } from "@/lib/diagnostics/queryDiagnostics";
 import {
   HYPOPG_CREATE_SQL,
+  HYPOPG_LOCK_TIMEOUT_SQL,
   HYPOPG_PROBE_SQL,
   HYPOPG_RESET_SQL,
   buildHypopgInstallHint,
@@ -10110,6 +10111,8 @@ export const useQueryStore = defineStore("query", () => {
       // 服务器文件已装但当前库还没登记扩展：超级用户下由 DBX 直接登记。
       if (!probe.installed && probe.available && probe.isSuperuser) {
         try {
+          // 别的会话可能有长事务占着 catalog 锁，先限制等待时间，避免拖满查询超时。
+          await run(HYPOPG_LOCK_TIMEOUT_SQL);
           await run(`${HYPOPG_CREATE_SQL};`);
           probe = parseHypopgProbe(await run(HYPOPG_PROBE_SQL));
           if (probe.installed) autoCreatedVersion = probe.extensionVersion;
@@ -10120,6 +10123,8 @@ export const useQueryStore = defineStore("query", () => {
 
       if (!probe.installed) {
         const baseHint = profile ? buildHypopgInstallHint(profile) : undefined;
+        // 自动登记失败时优先展示真实报错，不再套“需要超级用户”的通用说法。
+        const hintNote = installError ? undefined : t("diagnostics.hypopgNeedSuperuser");
         return {
           availability: probe.available ? "available" : "missing",
           serverKey,
@@ -10128,12 +10133,11 @@ export const useQueryStore = defineStore("query", () => {
           promptSuppressed,
           profile,
           // 文件已经装好、只差 CREATE EXTENSION 时不需要再给包管理器命令。
-          installHint: promptSuppressed ? undefined : probe.available && baseHint ? { ...baseHint, shellCommands: [], note: t("diagnostics.hypopgNeedSuperuser") } : baseHint,
-          note: probe.available ? t("diagnostics.hypopgAvailableNotCreated") : undefined,
+          installHint: promptSuppressed ? undefined : probe.available && baseHint ? { ...baseHint, shellCommands: [], note: hintNote } : baseHint,
+          note: probe.available ? (installError ? t("diagnostics.hypopgCreateFailed") : t("diagnostics.hypopgAvailableNotCreated")) : undefined,
           error: installError,
         };
       }
-
       const trials: HypopgTrial[] = [];
       for (const group of planHypopgTrials(suggestions)) {
         const indexNames: string[] = [];

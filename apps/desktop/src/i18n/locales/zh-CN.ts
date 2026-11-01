@@ -3744,6 +3744,7 @@ export default withEnglishFallback({
     hypopgNeedSuperuser: "服务器已装 hypopg 文件，但当前数据库还没登记扩展；CREATE EXTENSION 需要超级用户，请用超级用户执行上面的 SQL。",
     hypopgAvailableTitle: "服务器已装 hypopg，当前数据库未启用",
     hypopgAvailableNotCreated: "服务器已具备 hypopg，等待在当前数据库创建扩展。",
+    hypopgCreateFailed: "自动创建扩展失败（可能被其他会话的长事务锁住），可执行上面的 SQL 后重新诊断。",
     hypopgAutoCreated: "已自动创建扩展 hypopg（版本 {version}）。",
   },
   explain: {
