@@ -7174,31 +7174,47 @@ fn spawn_txn_idle_watcher_for_sessions(
     sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, TransactionSession>>>,
     txn_session_id: String,
 ) {
+    // 会话正在执行或刚有活动时不能只在第一次醒来检查一次就退出：那样这个
+    // 后台会话再也不会被回收，连接会一直停在 idle in transaction。
+    const BUSY_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
     tokio::spawn(async move {
         // The window is fixed per session at BEGIN; a vanished session needs no watcher.
         let Some(idle_timeout) = sessions.read().await.get(&txn_session_id).map(|session| session.idle_timeout) else {
             return;
         };
-        tokio::time::sleep(idle_timeout).await;
+        loop {
+            // 每轮按最新的活动时间重算剩余静默窗口，新的执行会把窗口顺延。
+            let Some(remaining) = sessions
+                .read()
+                .await
+                .get(&txn_session_id)
+                .map(|session| idle_timeout.saturating_sub(session.last_activity.elapsed()))
+            else {
+                return;
+            };
+            // 静默窗口已耗尽但会话仍在执行时短暂轮询，避免忙等。
+            tokio::time::sleep(if remaining.is_zero() { BUSY_RECHECK_INTERVAL } else { remaining }).await;
 
-        let removed: Option<TransactionSession> = {
-            let mut guard = sessions.write().await;
-            match guard.get(&txn_session_id) {
-                Some(session) if !session.busy && session.last_activity.elapsed() >= session.idle_timeout => {
-                    guard.remove(&txn_session_id)
+            let removed: Option<TransactionSession> = {
+                let mut guard = sessions.write().await;
+                match guard.get(&txn_session_id) {
+                    Some(session) if !session.busy && session.last_activity.elapsed() >= session.idle_timeout => {
+                        guard.remove(&txn_session_id)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        };
+            };
 
-        if let Some(session) = removed {
-            let mut conn = session.connection.lock().await;
-            let _ = rollback_manual_txn_connection(&mut conn).await;
-            log::info!(
-                "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after {}s of inactivity",
-                txn_session_id,
-                session.idle_timeout.as_secs()
-            );
+            if let Some(session) = removed {
+                let mut conn = session.connection.lock().await;
+                let _ = rollback_manual_txn_connection(&mut conn).await;
+                log::info!(
+                    "[query][manual_txn:idle_timeout] session_id={} auto-rolled back after {}s of inactivity",
+                    txn_session_id,
+                    session.idle_timeout.as_secs()
+                );
+                return;
+            }
         }
     });
 }
@@ -8544,6 +8560,36 @@ for line in sys.stdin:
         let guard = sessions.read().await;
         assert!(!guard.contains_key("short"), "a 50ms session must be reaped long before the 300s default");
         assert!(guard.contains_key("long"), "a session with a longer window must survive the same wait");
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_keeps_watching_a_session_that_is_busy_at_first_check() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let mut guard = sessions.write().await;
+            let mut session = idle_test_session(Duration::from_millis(50));
+            session.busy = true;
+            guard.insert("busy".to_string(), session);
+        }
+        spawn_txn_idle_watcher_for_sessions(Arc::clone(&sessions), "busy".to_string());
+
+        // 第一次醒来时会话仍在执行：只检查一次的旧实现会在这里退出，会话再也不会被回收。
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        {
+            let mut guard = sessions.write().await;
+            if let Some(session) = guard.get_mut("busy") {
+                session.busy = false;
+                session.last_activity = std::time::Instant::now();
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let guard = sessions.read().await;
+        assert!(
+            !guard.contains_key("busy"),
+            "a session that was busy at the first check must still be reaped once it goes idle"
+        );
     }
 
     #[tokio::test]
