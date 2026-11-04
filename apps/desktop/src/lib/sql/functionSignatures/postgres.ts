@@ -1,13 +1,18 @@
+import { POSTGRES_DOCUMENTED_FUNCTION_SIGNATURES } from "@/lib/sql/postgres/catalog";
+
 /**
  * PostgreSQL 家族内置函数签名。
  *
  * 说明：
  * - 这里同时作为 PG 兼容库（openGauss / GaussDB / Kingbase / Vastbase / HighGo / UXDB / SunDB / Redshift）
  *   的共享函数表，`sqlCompletion.ts` 里按家族注册。
- * - 只收录高频 SQL 内置函数，参数名按 PostgreSQL 官方文档口径，仅作为补全提示与签名提示，不做语法校验。
+ * - 本文件只手工维护高频函数（参数名按 PostgreSQL 官方文档口径、更贴近人话）；
+ *   PostgreSQL 18 官方文档里的完整函数清单由 `@/lib/sql/postgres/catalog` 提供，
+ *   两者合并后同名条目保留手工版本。
+ * - 仅作为补全提示与签名提示，不做语法校验。
  * - 窗口函数（ROW_NUMBER/RANK/LAG 等）由 `WINDOW_FUNCTIONS` 单独提供，此处不重复。
  */
-export const POSTGRES_FUNCTION_SIGNATURES = new Map<string, string[]>([
+const CURATED_POSTGRES_FUNCTION_SIGNATURES: Array<[string, string[]]> = [
   // 字符串
   ["LENGTH", ["string"]],
   ["CHAR_LENGTH", ["string"]],
@@ -136,7 +141,9 @@ export const POSTGRES_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["CURRENT_DATABASE", []],
   ["PG_BACKEND_PID", []],
   ["PG_TYPEOF", ["any"]],
-]);
+];
+
+export const POSTGRES_FUNCTION_SIGNATURES = new Map<string, string[]>([...POSTGRES_DOCUMENTED_FUNCTION_SIGNATURES, ...CURATED_POSTGRES_FUNCTION_SIGNATURES]);
 
 /**
  * PostgreSQL 家族中语法与「逗号分隔参数」不同的函数，补全时按模板插入，

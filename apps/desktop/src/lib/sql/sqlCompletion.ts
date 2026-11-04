@@ -25,6 +25,8 @@ import { HIVE_SPARK_FUNCTION_APPLY_TEMPLATES, HIVE_SPARK_FUNCTION_SIGNATURES } f
 import { ORACLE_FUNCTION_APPLY_TEMPLATES, ORACLE_FUNCTION_SIGNATURES } from "@/lib/sql/functionSignatures/oracle";
 import { POSTGRES_FUNCTION_APPLY_TEMPLATES, POSTGRES_FUNCTION_SIGNATURES } from "@/lib/sql/functionSignatures/postgres";
 import { TRINO_FUNCTION_APPLY_TEMPLATES, TRINO_FUNCTION_SIGNATURES } from "@/lib/sql/functionSignatures/trino";
+import { POSTGRES_EXPRESSION_TYPE_KEYWORDS, POSTGRES_KEYWORDS, POSTGRES_SYNTAX_PHRASES, POSTGRES_TYPE_KEYWORDS } from "@/lib/sql/postgres/catalog";
+import { SQLSERVER_DOCUMENTED_FUNCTION_SIGNATURES, SQLSERVER_KEYWORDS, SQLSERVER_SYNTAX_PHRASES, SQLSERVER_SYSTEM_VARIABLES, SQLSERVER_TYPE_KEYWORDS } from "@/lib/sql/sqlserver/catalog";
 import { rejectsAliasReferenceInHaving } from "@/lib/database/databaseFeatureSupport";
 import { isOracleCompletionDatabase, isSequenceCompletionDatabase } from "@/lib/sql/oracleCompletionSession";
 import { normalizeSqlTableCompletionSchemaQualification, type SqlTableCompletionSchemaQualification } from "@/lib/sql/sqlCompletionSchemaQualification";
@@ -407,53 +409,60 @@ const COMMON_SQL_KEYWORDS = [
   "VARCHAR",
 ];
 
-const POSTGRES_SQL_KEYWORDS = [
-  "COMMENT",
-  "BIGSERIAL",
-  "JSON",
-  "JSONB",
-  "SMALLSERIAL",
-  "SERIAL",
-  "UUID",
-  "INET",
-  "CIDR",
-  "MACADDR",
-  "MACADDR8",
-  "TSVECTOR",
-  "TSQUERY",
-  "BYTEA",
-  "BOOLEAN",
-  "TIMESTAMPTZ",
-  "TIMETZ",
-  "INTERVAL",
-  "INT2",
-  "INT4",
-  "INT8",
-  "FLOAT4",
-  "FLOAT8",
-  "MONEY",
-  "VARBIT",
-  "DOUBLE PRECISION",
-  "RETURNING",
-  "ILIKE",
-  "SIMILAR TO",
-  "ON CONFLICT",
-  "DO NOTHING",
-  "DO UPDATE",
-  "GENERATED",
-  "IDENTITY",
-  "MATERIALIZED",
-  "VACUUM",
-  "ARRAY_AGG",
-  "JSONB_BUILD_OBJECT",
-  "JSONB_AGG",
-  "TO_JSONB",
-  "CURRENT_DATE",
-  "CURRENT_TIME",
-  "CURRENT_TIMESTAMP",
-  "LOCALTIME",
-  "LOCALTIMESTAMP",
-];
+// PostgreSQL 的历史高频词条 + PostgreSQL 18 完整关键字表（官方 kwlist.h）、
+// 数据类型（含多词写法）与语法短语。generated 词表见 `@/lib/sql/postgres/catalog`。
+const POSTGRES_SQL_KEYWORDS = Array.from(
+  new Set([
+    "COMMENT",
+    "BIGSERIAL",
+    "JSON",
+    "JSONB",
+    "SMALLSERIAL",
+    "SERIAL",
+    "UUID",
+    "INET",
+    "CIDR",
+    "MACADDR",
+    "MACADDR8",
+    "TSVECTOR",
+    "TSQUERY",
+    "BYTEA",
+    "BOOLEAN",
+    "TIMESTAMPTZ",
+    "TIMETZ",
+    "INTERVAL",
+    "INT2",
+    "INT4",
+    "INT8",
+    "FLOAT4",
+    "FLOAT8",
+    "MONEY",
+    "VARBIT",
+    "DOUBLE PRECISION",
+    "RETURNING",
+    "ILIKE",
+    "SIMILAR TO",
+    "ON CONFLICT",
+    "DO NOTHING",
+    "DO UPDATE",
+    "GENERATED",
+    "IDENTITY",
+    "MATERIALIZED",
+    "VACUUM",
+    "ARRAY_AGG",
+    "JSONB_BUILD_OBJECT",
+    "JSONB_AGG",
+    "TO_JSONB",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    ...POSTGRES_KEYWORDS,
+    ...POSTGRES_TYPE_KEYWORDS,
+    ...POSTGRES_SYNTAX_PHRASES,
+  ]),
+);
 
 const MYSQL_SQL_KEYWORDS = [
   "AUTO_INCREMENT",
@@ -535,120 +544,128 @@ const DUCKDB_SQL_KEYWORDS = [
   "INTERVAL",
 ];
 
-const SQLSERVER_SQL_KEYWORDS = [
-  "TOP",
-  "IDENTITY",
-  "IDENTITY_INSERT",
-  "UNIQUEIDENTIFIER",
-  "INTEGER",
-  "ROWVERSION",
-  "HIERARCHYID",
-  "SQL_VARIANT",
-  "GEOMETRY",
-  "GEOGRAPHY",
-  "NVARCHAR",
-  "DATETIME2",
-  "DATETIMEOFFSET",
-  "BIT",
-  "GO",
-  "MERGE",
-  "OUTPUT",
-  "TRY_CAST",
-  "TRY_CONVERT",
-  "OPENJSON",
-  "JSON_VALUE",
-  "JSON_QUERY",
-  "NOCOUNT",
-  "XACT_ABORT",
-  "ANSI_NULLS",
-  "ANSI_PADDING",
-  "ANSI_WARNINGS",
-  "ANSI_DEFAULTS",
-  "ARITHABORT",
-  "ARITHIGNORE",
-  "QUOTED_IDENTIFIER",
-  "IMPLICIT_TRANSACTIONS",
-  "TRANSACTION ISOLATION LEVEL",
-  "DATEFIRST",
-  "DATEFORMAT",
-  "DEADLOCK_PRIORITY",
-  "LOCK_TIMEOUT",
-  "ROWCOUNT",
-  "TEXTSIZE",
-  "STATISTICS IO",
-  "STATISTICS TIME",
-  "STATISTICS XML",
-  "SHOWPLAN_ALL",
-  "SHOWPLAN_TEXT",
-  "SHOWPLAN_XML",
-  // T-SQL statements and control flow. `DECLARE` in particular is what issue #9319 reported:
-  // typing `decl` only offered `DECIMAL`, so scripting a batch had no completion at all.
-  "DECLARE",
-  "EXEC",
-  "EXECUTE",
-  "PRINT",
-  "RETURN",
-  "IF",
-  "WHILE",
-  "BREAK",
-  "CONTINUE",
-  "GOTO",
-  "WAITFOR",
-  "RAISERROR",
-  "THROW",
-  "TRY",
-  "CATCH",
-  "BEGIN TRY",
-  "BEGIN CATCH",
-  "BEGIN TRANSACTION",
-  "COMMIT TRANSACTION",
-  "ROLLBACK TRANSACTION",
-  "SAVE TRANSACTION",
-  "TRIGGER",
-  "PROCEDURE",
-  "FUNCTION",
-  "RETURNS",
-  "PIVOT",
-  "UNPIVOT",
-  "CROSS APPLY",
-  "OUTER APPLY",
-  "OPTION",
-  "RECOMPILE",
-  "MAXRECURSION",
-  // Frequently used T-SQL functions and session/system values. Built-in functions with
-  // parameter signatures (CONVERT, ISNULL, GETDATE, NEWID, STUFF, ...) are completed from
-  // SQLSERVER_FUNCTION_SIGNATURES instead; buildKeywordItems filters keywords that already
-  // have a signature, so they are not duplicated here. IIF has no SQL Server signature
-  // entry and is therefore listed as a keyword.
-  "IIF",
-  "CHOOSE",
-  "STRING_AGG",
-  "OBJECT_ID",
-  "SCOPE_IDENTITY",
-  "IDENT_CURRENT",
-  "SP_EXECUTESQL",
-  "SYSTEM_USER",
-  "SESSION_USER",
-  "CURRENT_USER",
-  "USER_NAME",
-  "SCHEMA_NAME",
-  "DATABASEPROPERTYEX",
-  "XACT_STATE",
-  "ERROR_MESSAGE",
-  "ERROR_NUMBER",
-  "ERROR_SEVERITY",
-  "ERROR_STATE",
-  "ERROR_LINE",
-  "ERROR_PROCEDURE",
-  "@@ERROR",
-  "@@IDENTITY",
-  "@@ROWCOUNT",
-  "@@TRANCOUNT",
-  "@@FETCH_STATUS",
-  "@@SERVERNAME",
-  "@@VERSION",
-  "@@SPID",
-];
+// SQL Server 的历史高频词条 + 官方「Reserved Keywords (Transact-SQL)」全量关键字、
+// `@@` 系统变量、数据类型与多词语法短语。generated 词表见 `@/lib/sql/sqlserver/catalog`。
+const SQLSERVER_SQL_KEYWORDS = Array.from(
+  new Set([
+    "TOP",
+    "IDENTITY",
+    "IDENTITY_INSERT",
+    "UNIQUEIDENTIFIER",
+    "INTEGER",
+    "ROWVERSION",
+    "HIERARCHYID",
+    "SQL_VARIANT",
+    "GEOMETRY",
+    "GEOGRAPHY",
+    "NVARCHAR",
+    "DATETIME2",
+    "DATETIMEOFFSET",
+    "BIT",
+    "GO",
+    "MERGE",
+    "OUTPUT",
+    "TRY_CAST",
+    "TRY_CONVERT",
+    "OPENJSON",
+    "JSON_VALUE",
+    "JSON_QUERY",
+    "NOCOUNT",
+    "XACT_ABORT",
+    "ANSI_NULLS",
+    "ANSI_PADDING",
+    "ANSI_WARNINGS",
+    "ANSI_DEFAULTS",
+    "ARITHABORT",
+    "ARITHIGNORE",
+    "QUOTED_IDENTIFIER",
+    "IMPLICIT_TRANSACTIONS",
+    "TRANSACTION ISOLATION LEVEL",
+    "DATEFIRST",
+    "DATEFORMAT",
+    "DEADLOCK_PRIORITY",
+    "LOCK_TIMEOUT",
+    "ROWCOUNT",
+    "TEXTSIZE",
+    "STATISTICS IO",
+    "STATISTICS TIME",
+    "STATISTICS XML",
+    "SHOWPLAN_ALL",
+    "SHOWPLAN_TEXT",
+    "SHOWPLAN_XML",
+    // T-SQL statements and control flow. `DECLARE` in particular is what issue #9319 reported:
+    // typing `decl` only offered `DECIMAL`, so scripting a batch had no completion at all.
+    "DECLARE",
+    "EXEC",
+    "EXECUTE",
+    "PRINT",
+    "RETURN",
+    "IF",
+    "WHILE",
+    "BREAK",
+    "CONTINUE",
+    "GOTO",
+    "WAITFOR",
+    "RAISERROR",
+    "THROW",
+    "TRY",
+    "CATCH",
+    "BEGIN TRY",
+    "BEGIN CATCH",
+    "BEGIN TRANSACTION",
+    "COMMIT TRANSACTION",
+    "ROLLBACK TRANSACTION",
+    "SAVE TRANSACTION",
+    "TRIGGER",
+    "PROCEDURE",
+    "FUNCTION",
+    "RETURNS",
+    "PIVOT",
+    "UNPIVOT",
+    "CROSS APPLY",
+    "OUTER APPLY",
+    "OPTION",
+    "RECOMPILE",
+    "MAXRECURSION",
+    // Frequently used T-SQL functions and session/system values. Built-in functions with
+    // parameter signatures (CONVERT, ISNULL, GETDATE, NEWID, STUFF, ...) are completed from
+    // SQLSERVER_FUNCTION_SIGNATURES instead; buildKeywordItems filters keywords that already
+    // have a signature, so they are not duplicated here. IIF has no SQL Server signature
+    // entry and is therefore listed as a keyword.
+    "IIF",
+    "CHOOSE",
+    "STRING_AGG",
+    "OBJECT_ID",
+    "SCOPE_IDENTITY",
+    "IDENT_CURRENT",
+    "SP_EXECUTESQL",
+    "SYSTEM_USER",
+    "SESSION_USER",
+    "CURRENT_USER",
+    "USER_NAME",
+    "SCHEMA_NAME",
+    "DATABASEPROPERTYEX",
+    "XACT_STATE",
+    "ERROR_MESSAGE",
+    "ERROR_NUMBER",
+    "ERROR_SEVERITY",
+    "ERROR_STATE",
+    "ERROR_LINE",
+    "ERROR_PROCEDURE",
+    "@@ERROR",
+    "@@IDENTITY",
+    "@@ROWCOUNT",
+    "@@TRANCOUNT",
+    "@@FETCH_STATUS",
+    "@@SERVERNAME",
+    "@@VERSION",
+    "@@SPID",
+    ...SQLSERVER_KEYWORDS,
+    ...SQLSERVER_SYSTEM_VARIABLES,
+    ...SQLSERVER_TYPE_KEYWORDS,
+    ...SQLSERVER_SYNTAX_PHRASES,
+  ]),
+);
 
 function sqlDialectCompletionWords(...sources: Array<string | undefined>): string[] {
   return sources
@@ -942,6 +959,8 @@ const DATA_TYPE_KEYWORDS = new Set([
   "MEDIUMBLOB",
   "LONGBLOB",
   ...ORACLE_SQL_TYPES,
+  ...POSTGRES_TYPE_KEYWORDS,
+  ...SQLSERVER_TYPE_KEYWORDS,
 ]);
 
 // Window functions that should use OVER() completion
@@ -1280,6 +1299,8 @@ const SQLITE_FUNCTION_SIGNATURES = new Map<string, string[]>([
 const CLOUDFLARE_D1_FUNCTION_SIGNATURES = new Map(Array.from(SQLITE_FUNCTION_SIGNATURES.entries()).filter(([name]) => name !== "NOW"));
 
 const SQLSERVER_FUNCTION_SIGNATURES = new Map<string, string[]>([
+  // 官方目录生成的完整函数表在前，手工维护的高频签名在后，同名时保留手工版本。
+  ...SQLSERVER_DOCUMENTED_FUNCTION_SIGNATURES,
   ["CONVERT", ["type", "expression"]],
   ["TRY_CAST", ["expression AS type"]],
   ["TRY_CONVERT", ["type", "expression"]],
@@ -1302,7 +1323,9 @@ const SQLSERVER_FUNCTION_SIGNATURES = new Map<string, string[]>([
   ["ISNULL", ["expression", "replacement"]],
 ]);
 
-const SQLSERVER_DATEPART_FUNCTIONS = new Set(["DATEADD", "DATEDIFF", "DATEPART", "DATENAME"]);
+// DATEDIFF_BIG / DATE_BUCKET / DATETRUNC 是 SQL Server 2016+ / 2022 新增的同族函数，
+// 首参同样是 datepart，补全时需要给出年月日等可选值。
+const SQLSERVER_DATEPART_FUNCTIONS = new Set(["DATEADD", "DATEDIFF", "DATEDIFF_BIG", "DATEPART", "DATENAME", "DATE_BUCKET", "DATETRUNC"]);
 const SQLSERVER_DATEPART_VALUES = ["year", "quarter", "month", "dayofyear", "day", "week", "weekday", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond", "tzoffset", "iso_week"];
 
 const MANTICORESEARCH_FUNCTION_SIGNATURES = new Map<string, string[]>([
@@ -2875,7 +2898,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
 
   const statementKind = detectStatementKind(beforeCursor || fullStatement);
   const selectListWildcardAfterCursor = isStandaloneSelectWildcard(rawStatement, cursor - statementSpan.start, selectListColumnContext, statementKind, resolveSqlDialectId(options));
-  const preferredValueKeywords = sqlServerDatepartCompletionValues(beforeCursor, options.databaseType);
+  const preferredValueKeywords = sqlServerDatepartCompletionValues(beforeCursor, options.databaseType) ?? postgresDatepartCompletionValues(beforeCursor, options.databaseType);
   const mysqlVariablesAllowed = (options.databaseType === "mysql" || (!options.databaseType && options.dialect === "mysql")) && !prefix.startsWith("@") && !qualifier && !dataTypeContext && !afterTableTrigger && !insertInfo && !inCallRoutineContext;
   const localVariables = prefix.startsWith("@") ? collectSqlServerLocalVariables(sql, cursor, options) : mysqlVariablesAllowed ? collectMysqlRoutineVariables(sql, cursor) : undefined;
   const preferredKeywords = qualifier ? [] : preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo, options.databaseType);
@@ -3048,6 +3071,24 @@ function sqlServerDatepartCompletionValues(beforeCursor: string, databaseType?: 
   const call = findActiveFunctionCall(beforeCursor);
   if (!call || call.activeGroup !== 0 || !SQLSERVER_DATEPART_FUNCTIONS.has(call.name.toUpperCase())) return undefined;
   return countTopLevelCommas(call.groupText) === 0 ? SQLSERVER_DATEPART_VALUES : undefined;
+}
+
+// PostgreSQL 的 date/time 字段名（官方文档 9.9.1 / 9.9.2）：
+// EXTRACT/DATE_PART 接受完整字段集，DATE_TRUNC 只接受可截断的时间单位。
+const POSTGRES_DATEPART_VALUES = ["microseconds", "milliseconds", "second", "minute", "hour", "day", "week", "month", "quarter", "year", "decade", "century", "millennium", "dow", "isodow", "doy", "isoyear", "epoch", "julian", "timezone", "timezone_hour", "timezone_minute"];
+
+const POSTGRES_DATE_TRUNC_VALUES = ["microseconds", "milliseconds", "second", "minute", "hour", "day", "week", "month", "quarter", "year", "decade", "century", "millennium"];
+
+function postgresDatepartCompletionValues(beforeCursor: string, databaseType?: DatabaseType): string[] | undefined {
+  if (databaseType === undefined || !POSTGRES_COMPAT_FUNCTION_DATABASES.has(databaseType)) return undefined;
+  const call = findActiveFunctionCall(beforeCursor);
+  // 只有第一个参数是日期字段；第二个参数已经是时间表达式，不能再输出字段名，
+  // 否则会走 preferredValueKeywords 的早返回分支，把列补全整个压掉。
+  if (!call || countTopLevelCommas(call.groupText) !== 0) return undefined;
+  const name = call.name.toUpperCase();
+  if (name === "EXTRACT" || name === "DATE_PART") return POSTGRES_DATEPART_VALUES;
+  if (name === "DATE_TRUNC") return POSTGRES_DATE_TRUNC_VALUES;
+  return undefined;
 }
 
 function findEnclosingCreateTableBodyStart(cleaned: string): number {
@@ -5615,10 +5656,24 @@ function isFollowedByJoin(beforeToken: string): boolean {
   return second === "join" || JOIN_MODIFIERS.has(second ?? "");
 }
 
+function unclosedParenthesisDepth(sql: string): number {
+  let depth = 0;
+  for (const ch of sql) {
+    if (ch === "(") depth += 1;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+  }
+  return depth;
+}
+
 function isInTableListContext(beforeToken: string, databaseType: DatabaseType | undefined): boolean {
   if (isInOrderOrGroupByContext(beforeToken, databaseType)) return false;
   const cleaned = activeQueryBlockSql(maskSqlLiteralsAndComments(beforeToken, databaseType).trimEnd());
   if (!/,\s*$/.test(cleaned)) return false;
+  // A trailing comma inside an unclosed parenthesis belongs to a function/expression
+  // argument list (e.g. `CONVERT(date, t.` / `DATE_TRUNC(month, t.`), not to the
+  // FROM/JOIN table list. Without this guard the alias qualifier is treated as a
+  // table target and column completion is suppressed.
+  if (unclosedParenthesisDepth(cleaned) > 0) return false;
 
   // Only commas in the active top-level table segment should continue table completion.
   const lastTableIntro = Math.max(lastTopLevelKeywordIndex(cleaned, "from"), lastTopLevelKeywordIndex(cleaned, "join"), lastTopLevelKeywordIndex(cleaned, "update"), lastTopLevelKeywordIndex(cleaned, "into"));
@@ -6347,7 +6402,13 @@ function activeFunctionSignatures(databaseType?: DatabaseType): Map<string, stri
   const signatures = databaseType ? new Map(Array.from(SQL_FUNCTION_SIGNATURES.entries()).filter(([name]) => commonFunctionNames.has(name))) : new Map(SQL_FUNCTION_SIGNATURES);
   const databaseSignatures = databaseType ? DATABASE_FUNCTION_SIGNATURES[databaseType] : undefined;
   if (databaseSignatures) {
-    for (const [name, parameters] of databaseSignatures) signatures.set(name, parameters);
+    for (const [name, parameters] of databaseSignatures) {
+      // 文档生成的签名里，无参条目可能只是正文里的一次提及（例如 COALESCE 章节里的
+      // NVL/IFNULL），不能用它覆盖已有的参数信息。
+      const existing = signatures.get(name);
+      if (existing !== undefined && existing.length > 0 && parameters.length === 0) continue;
+      signatures.set(name, parameters);
+    }
   }
   return signatures;
 }
@@ -6407,6 +6468,8 @@ function buildFunctionSnippetItems(prefix: string, functionDescriptions: Map<str
 
   for (const [name, parameters] of activeFunctionSignatures(databaseType).entries()) {
     if (!matchesPrefix(name, prefix)) continue;
+    // 窗口函数由下面的 OVER() 分支专门提供，官方文档生成的同名裸函数会抢掉模板。
+    if (WINDOW_FUNCTIONS.has(name)) continue;
     const functionName = applySqlFunctionCase(name, functionCase);
     const paramStr = parameters.length > 0 ? parameters.map((p) => `\${${applyGeneratedSqlTemplateKeywordCase(p, keywordCase)}}`).join(", ") : "";
     const applyTemplate = functionApplyTemplate(databaseType, name);
@@ -6575,13 +6638,17 @@ function buildKeywordItems(prefix: string, context: SqlCompletionContext, databa
   const isDml = context.statementKind === "select" || context.statementKind === "insert" || context.statementKind === "update" || context.statementKind === "delete";
   const showDdl = !isDml || context.suggestTables || context.dataTypeContext;
   const functionSignatures = activeFunctionSignatures(databaseType);
+  // PostgreSQL 的类型字面量（INTERVAL '1 day'、TIMESTAMP '...'）和类型转换（x::JSONB）
+  // 都写在 SELECT/WHERE 里，所以这些类型不能按「只属于 DDL」处理。
+  const expressionTypeDatabase = databaseType !== undefined && (POSTGRES_COMPAT_FUNCTION_DATABASES.has(databaseType) || databaseType === "duckdb");
 
   return activeSqlKeywords(databaseType)
     .filter((keyword) => {
       if (functionSignatures.has(keyword) && !DATA_TYPE_KEYWORDS.has(keyword) && !DUAL_ROLE_SQL_KEYWORDS.has(keyword)) return false;
       if (WINDOW_FUNCTIONS.has(keyword)) return false;
       if (!matchesPrefix(keyword, prefix)) return false;
-      if (!showDdl && isDml && (DDL_ONLY_KEYWORDS.has(keyword) || DATA_TYPE_KEYWORDS.has(keyword))) return false;
+      const expressionType = expressionTypeDatabase && POSTGRES_EXPRESSION_TYPE_KEYWORDS.has(keyword.toUpperCase());
+      if (!showDdl && isDml && (DDL_ONLY_KEYWORDS.has(keyword) || (DATA_TYPE_KEYWORDS.has(keyword) && !expressionType))) return false;
       if (context.followingKeyword && keyword.includes(" ") && keyword.toUpperCase().endsWith(` ${context.followingKeyword}`)) return false;
       return true;
     })

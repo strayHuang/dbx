@@ -25,6 +25,8 @@
     "test:release": "node --test scripts/release.test.mjs",
     "build:knowledge-base": "node scripts/build-knowledge-base.mjs",
     "generate:connection-types": "node scripts/sync-connection-types.mjs",
+    "generate:postgres-catalog": "node scripts/generate-postgres-catalog.mjs",
+    "generate:sqlserver-catalog": "node scripts/generate-sqlserver-catalog.mjs",
     "check:connection-types": "node scripts/sync-connection-types.mjs --check",
     "pretypecheck": "pnpm generate:connection-types",
     "typecheck": "vue-tsc --noEmit --project apps/desktop/tsconfig.json",

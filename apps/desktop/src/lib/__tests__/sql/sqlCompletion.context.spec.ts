@@ -2606,6 +2606,35 @@ describe("select-list function argument completion", () => {
     expect(items.filter((item) => item.type === "column").every((item) => item.batchSelectionMode === undefined)).toBe(true);
     expect(getSqlCompletionContext(sql, cursor, options).selectListColumnContext).toBe(false);
   });
+
+  it.each([
+    ["sqlserver", "SELECT * FROM OSHp t1 INNER JOIN OSAL t2 ON t2.shpEntry = t1.DocEntry AND CONVERT(date, t2.", "sqlserver"],
+    ["postgres", "SELECT * FROM OSHp t1 INNER JOIN OSAL t2 ON t2.shpEntry = t1.DocEntry AND DATE_TRUNC(month, t2.", "postgres"],
+  ])("suggests alias columns after a function argument comma in %s", (_name, sql, databaseType) => {
+    const completionOptions = {
+      databaseType: databaseType as "sqlserver" | "postgres",
+      dialect: databaseType as "sqlserver" | "postgres",
+      tables: [
+        { name: "OSHp", schema: "dbo" },
+        { name: "OSAL", schema: "dbo" },
+      ],
+      columnsByTable: new Map([
+        ["oshp", ["DocEntry", "CardCode"].map((name) => ({ name, table: "OSHp" }))],
+        ["osal", ["shpEntry", "ItemCode"].map((name) => ({ name, table: "OSAL" }))],
+      ]),
+    };
+
+    const context = getSqlCompletionContext(sql, sql.length, completionOptions);
+    expect(context.exclusiveColumnSuggestions).toBe(true);
+    expect(shouldAutoOpenSqlCompletion(sql, sql.length, completionOptions)).toBe(true);
+
+    const items = buildSqlCompletionItems(sql, sql.length, completionOptions);
+    expect(items.filter((item) => item.type === "column").map((item) => item.label)).toEqual(expect.arrayContaining(["shpEntry", "ItemCode"]));
+
+    const semanticContext = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, sql.length, completionOptions), context);
+    expect(semanticContext.suggestColumns).toBe(true);
+    expect(semanticContext.qualifier).toBe("t2");
+  });
 });
 
 describe("smart unpaired SQL keyword completion before existing keywords (#11527)", () => {
