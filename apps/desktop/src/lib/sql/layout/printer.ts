@@ -272,6 +272,16 @@ function fillInList(writer: Writer, children: AstNode[], width: number, ctx: Sql
  */
 function writeParenthesis(writer: Writer, nodes: AstNode[], index: number, ctx: SqlLayoutContext): void {
   const node = nodes[index] as ParenthesisNode;
+  // `none` also applies to value lists inside a larger element (`ANY(ARRAY[...])`
+  // in a JOIN condition): they stay on one line rather than expanding one value
+  // per line.
+  if (ctx.options.logicalOperatorNewline === "none" && hasParenthesizedValueList(node.children)) {
+    const flat = renderInline(collapsedContext(ctx), node.children, Number.POSITIVE_INFINITY);
+    if (flat) {
+      writer.write(`${node.openParen}${flat}${node.closeParen}`);
+      return;
+    }
+  }
   const inner = measureParen(writer, nodes, index, ctx);
   if (inner) {
     writer.write(`${node.openParen}${inner}${node.closeParen}`);

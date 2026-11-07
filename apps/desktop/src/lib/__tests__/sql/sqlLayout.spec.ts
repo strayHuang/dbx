@@ -181,6 +181,13 @@ describe("sql layout", () => {
     expect(await format(sql, { logicalOperatorNewline: "before" })).toBe(lines("SELECT *", "FROM t", "WHERE id NOT IN (100000, 100001, 100002, 100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,", "                 100013, 100014, 100015);"));
   });
 
+  it("keeps a value list in a JOIN condition on one line by default", async () => {
+    const values = Array.from({ length: 38 }, (_, index) => index * 2 + 3).join(", ");
+    const sql = `SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id AND t1.shp_entry = ANY(ARRAY[${values}]);`;
+
+    expect(await format(sql, {}, "postgres")).toBe(`SELECT a\nFROM t1\n    INNER JOIN t2 ON t1.id = t2.id AND t1.shp_entry = ANY (ARRAY[${values}]);`);
+  });
+
   it("keeps a long ANY(ARRAY[...]) condition on one line by default", async () => {
     const values = Array.from({ length: 26 }, (_, index) => `'v${index}'`).join(", ");
     const sql = `SELECT * FROM t WHERE t.ship_entry = ANY(ARRAY[${values}]);`;
