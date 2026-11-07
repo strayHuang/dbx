@@ -9011,7 +9011,7 @@ export default withEnglishFallback({
     sqlFormatterLogicalOperatorNewline: "逻辑运算符换行",
     sqlFormatterLogicalBefore: "运算符前换行",
     sqlFormatterLogicalAfter: "运算符后换行",
-    sqlFormatterLogicalSameLine: "逻辑条件保持同一行",
+    sqlFormatterLogicalSameLine: "不换行",
     sqlFormatterCommaPosition: "逗号位置",
     sqlFormatterCommaPositionAfter: "字段后置（行尾）",
     sqlFormatterCommaPositionBefore: "字段前置（行首）",

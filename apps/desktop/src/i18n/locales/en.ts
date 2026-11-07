@@ -9043,7 +9043,7 @@ export default {
     sqlFormatterLogicalOperatorNewline: "Logical operator newline",
     sqlFormatterLogicalBefore: "Before operator",
     sqlFormatterLogicalAfter: "After operator",
-    sqlFormatterLogicalSameLine: "Keep on same line",
+    sqlFormatterLogicalSameLine: "No line break",
     sqlFormatterCommaPosition: "Comma position",
     sqlFormatterCommaPositionAfter: "After item (trailing)",
     sqlFormatterCommaPositionBefore: "Before item (leading)",
