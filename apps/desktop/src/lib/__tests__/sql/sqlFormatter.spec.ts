@@ -487,7 +487,8 @@ LIMIT 100;`);
 
     const aliasLines = formatted.split("\n").filter((line) => line.includes(' AS "recCreator'));
     expect(aliasLines).toHaveLength(2);
-    expect(aliasLines[0]!.indexOf(" AS ")).toBe(aliasLines[1]!.indexOf(" AS "));
+    expect(aliasLines[0]).toContain('JS1.REC_CREATOR AS "recCreator"');
+    expect(aliasLines[1]).toContain('JS1.REC_CREATOR_JOB_ID AS "recCreatorJobId"');
     // Known and unknown functions alike are written without a space before the
     // parenthesis.
     expect(formatted).toContain("DECODE(");

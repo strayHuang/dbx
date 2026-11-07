@@ -231,31 +231,22 @@ describe("sql layout", () => {
 
   it("keeps nested and simple CASE expressions compact", async () => {
     const sql = "SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END) AS total, CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label FROM t;";
-    const expected = lines("SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END)                  AS total,", "       CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label", "FROM t;");
+    const expected = lines("SELECT SUM(CASE WHEN a = 1 AND b = 2 THEN 1 ELSE 0 END) AS total,", "       CASE a WHEN 1 THEN CASE b WHEN 2 THEN 'x  y' END ELSE 'other' END AS label", "FROM t;");
     expect(await format(sql)).toBe(expected);
     expect(await format(expected)).toBe(expected);
   });
 
-  it("falls back to unaligned fields when an aligned alias would overflow the line width", async () => {
-    // Alignment pads every alias to one column past the widest expression, so
-    // the short expression's long alias lands exactly at the 120-column width;
-    // one more character and the whole list keeps the plain one-space layout.
-    const fitting = `SELECT ${"a".repeat(60)} AS total, ${"b".repeat(30)} AS ${"y".repeat(49)} FROM t;`;
-    expect(await format(fitting)).toBe(lines(`SELECT ${"a".repeat(60)} AS total,`, `       ${"b".repeat(30)}${" ".repeat(31)}AS ${"y".repeat(49)}`, "FROM t;"));
-
-    const overflowing = `SELECT ${"a".repeat(60)} AS total, ${"b".repeat(30)} AS ${"y".repeat(50)} FROM t;`;
-    expect(await format(overflowing)).toBe(lines(`SELECT ${"a".repeat(60)} AS total,`, `       ${"b".repeat(30)} AS ${"y".repeat(50)}`, "FROM t;"));
+  it("keeps a single space before AS instead of padding aliases to a column", async () => {
+    const sql = `SELECT ${"a".repeat(60)} AS total, ${"b".repeat(30)} AS ${"y".repeat(49)} FROM t;`;
+    expect(await format(sql)).toBe(lines(`SELECT ${"a".repeat(60)} AS total,`, `       ${"b".repeat(30)} AS ${"y".repeat(49)}`, "FROM t;"));
   });
 
-  it("keeps an unaliased field plain while the aliased ones align", async () => {
+  it("keeps a single space before AS for unaliased and aliased fields alike", async () => {
     expect(await format("SELECT a, b AS x, c AS yyy FROM t;")).toBe(lines("SELECT a,", "       b AS x,", "       c AS yyy", "FROM t;"));
-
-    // The alignment column comes from the aliased expressions only, so the
-    // bare field stays untouched beside the padded aliases.
-    expect(await format("SELECT a, bb AS x, c AS yyy FROM t;")).toBe(lines("SELECT a,", "       bb AS x,", "       c  AS yyy", "FROM t;"));
+    expect(await format("SELECT a, bb AS x, c AS yyy FROM t;")).toBe(lines("SELECT a,", "       bb AS x,", "       c AS yyy", "FROM t;"));
   });
 
-  it("keeps DBX JOIN and condition layout while aligning aliases and FROM", async () => {
+  it("keeps DBX JOIN and condition layout while using one space before AS", async () => {
     const sql = lines(
       "SELECT js.start_time AS jobslipstarttime, js.end_time AS jobslipendtime, js.job_area_ids AS jobareaids, jsm.job_slip_id, jsm.flag, upi.worker_basic_info_id AS workerid",
       "FROM loc_job_slip js LEFT JOIN loc_job_slip_audit jsa ON js.id = jsa.job_slip_id LEFT JOIN loc_job_slip_manager jsm ON js.id = jsm.job_slip_id LEFT JOIN loc_user_proj_info upi ON upi.bp_user_id = jsm.user_id",
@@ -263,9 +254,9 @@ describe("sql layout", () => {
     );
 
     const expected = lines(
-      "SELECT js.start_time            AS jobslipstarttime,",
-      "       js.end_time              AS jobslipendtime,",
-      "       js.job_area_ids          AS jobareaids,",
+      "SELECT js.start_time AS jobslipstarttime,",
+      "       js.end_time AS jobslipendtime,",
+      "       js.job_area_ids AS jobareaids,",
       "       jsm.job_slip_id,",
       "       jsm.flag,",
       "       upi.worker_basic_info_id AS workerid",
@@ -285,7 +276,6 @@ describe("sql layout", () => {
     const projection = formatted.split("\n").slice(0, 6);
     const fieldStartColumns = projection.map((line, index) => (index === 0 ? line.indexOf("js.start_time") : line.search(/\S/)));
     expect(new Set(fieldStartColumns)).toEqual(new Set([7]));
-    expect(new Set(projection.filter((line) => line.includes(" AS ")).map((line) => line.indexOf("AS"))).size).toBe(1);
   });
 
   it("preserves comments and width wrapping inside CASE expressions", async () => {
@@ -406,10 +396,10 @@ describe("sql layout", () => {
     expect(await format(sql, { commaPosition: "before" })).toBe(lines("SELECT loc_id", "     , loc_name", "     , loc_type", "     , delivery_emp_num", "     , update_time", "FROM tbl", "WHERE rn = 1;"));
   });
 
-  it("formats aligned projection aliases with leading commas", async () => {
+  it("keeps one space before AS with leading commas", async () => {
     const sql = lines("SELECT id AS emp_id, department_name AS dept, active_status AS status", "FROM employees;");
 
-    expect(await format(sql, { commaPosition: "before" })).toBe(lines("SELECT id              AS emp_id", "     , department_name AS dept", "     , active_status   AS status", "FROM employees;"));
+    expect(await format(sql, { commaPosition: "before" })).toBe(lines("SELECT id AS emp_id", "     , department_name AS dept", "     , active_status AS status", "FROM employees;"));
   });
 
   it("formats CREATE TABLE with leading commas in DDL", async () => {
@@ -440,12 +430,12 @@ describe("sql layout", () => {
 
   it("preserves keyword case when keywordCase is preserve (#11382)", async () => {
     const sql = lines("select id as emp_id, name as emp_name", "from employees", "where status = 1 and dept = 'sales'", "order by id desc", "limit 10;");
-    expect(await format(sql, { keywordCase: "preserve", logicalOperatorNewline: "before" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
+    expect(await format(sql, { keywordCase: "preserve", logicalOperatorNewline: "before" })).toBe(lines("select id as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
   });
 
   it("converts keyword case to lower when keywordCase is lower (#11382)", async () => {
     const sql = lines("SELECT id AS emp_id, name AS emp_name", "FROM employees", "WHERE status = 1 AND dept = 'sales'", "ORDER BY id DESC", "LIMIT 10;");
-    expect(await format(sql, { keywordCase: "lower", logicalOperatorNewline: "before" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
+    expect(await format(sql, { keywordCase: "lower", logicalOperatorNewline: "before" })).toBe(lines("select id as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
   });
 
   it("preserves keyword case in join, union, case expression and ddl (#11382)", async () => {
