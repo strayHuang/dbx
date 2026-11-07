@@ -348,11 +348,53 @@ function printCondition(writer: Writer, operands: AstNode[][], baseColumn: numbe
   }
 }
 
+function isAstNode(value: unknown): value is AstNode {
+  return typeof value === "object" && value !== null && typeof (value as { type?: unknown }).type === "string";
+}
+
+/**
+ * True when a node is, or contains, a comma-separated value list with no clauses
+ * of its own (`IN (...)`, `ANY(ARRAY[...])`, a multi-argument call). Those lists
+ * are values rather than nested statements, so the caller keeps them on one line
+ * instead of expanding them.
+ */
+function containsCommaSeparatedValueList(node: AstNode): boolean {
+  // Clauses keep their own layout: a subquery's projection and condition lists
+  // are not the value list this rule is about.
+  if (isBodyNode(node)) return false;
+  if (isParenthesis(node)) {
+    if (node.children.some(isBodyNode)) return false;
+    if (splitByComma(node.children).length > 1) return true;
+  }
+  for (const value of Object.values(node as unknown as Record<string, unknown>)) {
+    if (Array.isArray(value)) {
+      if (value.some((child) => isAstNode(child) && containsCommaSeparatedValueList(child))) return true;
+    } else if (isAstNode(value) && containsCommaSeparatedValueList(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasParenthesizedValueList(nodes: AstNode[]): boolean {
+  return nodes.some(containsCommaSeparatedValueList);
+}
+
 /**
  * Emits one clause item, expanding only those parentheses that do not fit on the
  * current line.
  */
 function printElement(writer: Writer, nodes: AstNode[], baseColumn: number, ctx: SqlLayoutContext): void {
+  // `none` keeps a condition and its value lists on one line however wide they
+  // get: the editor's own soft wrap takes over instead of formatter line breaks.
+  if (ctx.options.logicalOperatorNewline === "none" && (nodes.some(isLogicalOperator) || hasParenthesizedValueList(nodes))) {
+    const whole = renderInline(ctx, nodes, Number.POSITIVE_INFINITY);
+    if (whole) {
+      writer.write(whole);
+      return;
+    }
+  }
+
   const whole = renderInline(ctx, nodes, ctx.options.lineWidth - writer.column);
   if (whole) {
     writer.write(whole);

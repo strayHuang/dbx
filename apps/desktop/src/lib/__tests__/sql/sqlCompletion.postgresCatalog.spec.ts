@@ -45,6 +45,24 @@ describe("PostgreSQL 18 completion catalog", () => {
     expect(POSTGRES_FUNCTION_SIGNATURES.get("DATE_TRUNC")).toEqual(["field", "source"]);
   });
 
+  it("suggests PostgreSQL data types after the :: cast operator", () => {
+    const sql = "SELECT t.id::";
+    const labels = labelsFor(sql);
+    expect(labels).toContain("TEXT");
+    expect(labels).toContain("JSONB");
+    expect(labels).toContain("INTERVAL");
+    expect(labels).not.toContain("SELECT");
+    expect(shouldAutoOpenSqlCompletion(sql, sql.length, POSTGRES_OPTIONS)).toBe(true);
+  });
+
+  it("filters cast targets by the prefix typed after ::", () => {
+    const sql = "SELECT t.id::te";
+    const labels = labelsFor(sql);
+    expect(labels).toContain("TEXT");
+    expect(labels).not.toContain("JSONB");
+    expect(shouldAutoOpenSqlCompletion(sql, sql.length, POSTGRES_OPTIONS)).toBe(true);
+  });
+
   it("suggests date/time field values inside DATE_TRUNC and EXTRACT", () => {
     const truncLabels = labelsFor("SELECT DATE_TRUNC(");
     expect(truncLabels).toContain("MONTH");

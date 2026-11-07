@@ -143,11 +143,11 @@ describe("sql layout", () => {
   it("breaks a long condition before each logical operator", async () => {
     const sql = "SELECT a, b FROM t WHERE alpha = 1 AND beta = 2 AND gamma = 3 AND delta = 4 AND epsilon = 5 AND zeta = 6 AND eta = 7 AND theta = 8;";
 
-    // The statement is too long to collapse, and the default
+    // The statement is too long to collapse, and explicit
     // `logicalOperatorNewline: "before"` starts each continuation line with the
     // operator, aligned under the condition's first operand like any other
     // clause item.
-    expect(await format(sql)).toBe(lines("SELECT a,", "       b", "FROM t", "WHERE alpha = 1", "      AND beta = 2", "      AND gamma = 3", "      AND delta = 4", "      AND epsilon = 5", "      AND zeta = 6", "      AND eta = 7", "      AND theta = 8;"));
+    expect(await format(sql, { logicalOperatorNewline: "before" })).toBe(lines("SELECT a,", "       b", "FROM t", "WHERE alpha = 1", "      AND beta = 2", "      AND gamma = 3", "      AND delta = 4", "      AND epsilon = 5", "      AND zeta = 6", "      AND eta = 7", "      AND theta = 8;"));
   });
 
   it("puts a wrapped condition's operators where the setting asks", async () => {
@@ -159,10 +159,18 @@ describe("sql layout", () => {
     expect(await format(sql, { logicalOperatorNewline: "none" })).toBe(lines("SELECT a,", "       b", "FROM t", "WHERE alpha = 1 AND beta = 2 AND gamma = 3 AND delta = 4 AND epsilon = 5 AND zeta = 6 AND eta = 7 AND theta = 8;"));
   });
 
-  it("fills an IN list that does not fit onto as few lines as fit, aligned under its first item", async () => {
+  it("keeps a value list on one line by default, however wide it gets", async () => {
     const sql = `SELECT * FROM t WHERE id IN (${Array.from({ length: 16 }, (_, index) => 100000 + index).join(", ")});`;
 
-    expect(await format(sql)).toBe(lines("SELECT *", "FROM t", "WHERE id IN (100000, 100001, 100002, 100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,", "             100013, 100014, 100015);"));
+    // The default `none` never breaks a condition or its value list: the editor's
+    // own soft wrap is what the user sees, not formatter line breaks.
+    expect(await format(sql)).toBe(`SELECT *\nFROM t\nWHERE id IN (${Array.from({ length: 16 }, (_, index) => 100000 + index).join(", ")});`);
+  });
+
+  it("fills an IN list that does not fit when logical operators are configured to break", async () => {
+    const sql = `SELECT * FROM t WHERE id IN (${Array.from({ length: 16 }, (_, index) => 100000 + index).join(", ")});`;
+
+    expect(await format(sql, { logicalOperatorNewline: "before" })).toBe(lines("SELECT *", "FROM t", "WHERE id IN (100000, 100001, 100002, 100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,", "             100013, 100014, 100015);"));
   });
 
   it("keeps a NOT IN list that does not fit compact as well", async () => {
@@ -170,7 +178,14 @@ describe("sql layout", () => {
 
     // "WHERE id NOT IN (" is 17 columns, so 13 six-digit values fit per line
     // before the fill wraps; the closing parenthesis rides on the last line.
-    expect(await format(sql)).toBe(lines("SELECT *", "FROM t", "WHERE id NOT IN (100000, 100001, 100002, 100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,", "                 100013, 100014, 100015);"));
+    expect(await format(sql, { logicalOperatorNewline: "before" })).toBe(lines("SELECT *", "FROM t", "WHERE id NOT IN (100000, 100001, 100002, 100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,", "                 100013, 100014, 100015);"));
+  });
+
+  it("keeps a long ANY(ARRAY[...]) condition on one line by default", async () => {
+    const values = Array.from({ length: 26 }, (_, index) => `'v${index}'`).join(", ");
+    const sql = `SELECT * FROM t WHERE t.ship_entry = ANY(ARRAY[${values}]);`;
+
+    expect(await format(sql, {}, "postgres")).toBe(`SELECT *\nFROM t\nWHERE t.ship_entry = ANY (ARRAY[${values}]);`);
   });
 
   it("keeps a small subquery inline", async () => {
@@ -246,9 +261,9 @@ describe("sql layout", () => {
       "      AND jsm.deleted = 0;",
     );
 
-    const formatted = await format(sql);
+    const formatted = await format(sql, { logicalOperatorNewline: "before" });
     expect(formatted).toBe(expected);
-    expect(await formatSqlText(sql, "mysql")).toBe(expected);
+    expect(await formatSqlText(sql, "mysql", { logicalOperatorNewline: "before" })).toBe(expected);
 
     const projection = formatted.split("\n").slice(0, 6);
     const fieldStartColumns = projection.map((line, index) => (index === 0 ? line.indexOf("js.start_time") : line.search(/\S/)));
@@ -291,13 +306,15 @@ describe("sql layout", () => {
 
     // Only the leading indentation becomes a tab; the alignment padding stays
     // spaces so a continuation column lands where it was measured.
-    expect(await format(sql, { useTabs: true, tabWidth: 4 })).toBe(["SELECT alpha_column,", "\t   beta_column,", "\t   gamma_column,", "\t   delta_column", "FROM some_really_long_table_name", "WHERE first_condition = 1", "\t  AND second_condition = 2", "\t  AND third_condition = 3;"].join("\n"));
+    expect(await format(sql, { useTabs: true, tabWidth: 4, logicalOperatorNewline: "before" })).toBe(
+      ["SELECT alpha_column,", "\t   beta_column,", "\t   gamma_column,", "\t   delta_column", "FROM some_really_long_table_name", "WHERE first_condition = 1", "\t  AND second_condition = 2", "\t  AND third_condition = 3;"].join("\n"),
+    );
   });
 
   it("moves a FROM source to its own line when configured", async () => {
     const sql = "SELECT alpha_column, beta_column, gamma_column, delta_column FROM some_really_long_table_name WHERE first_condition = 1 AND second_condition = 2 AND third_condition = 3;";
 
-    expect(await format(sql, { fromClauseLayout: "newLine" })).toBe(
+    expect(await format(sql, { fromClauseLayout: "newLine", logicalOperatorNewline: "before" })).toBe(
       lines("SELECT alpha_column,", "       beta_column,", "       gamma_column,", "       delta_column", "FROM", "  some_really_long_table_name", "WHERE first_condition = 1", "      AND second_condition = 2", "      AND third_condition = 3;"),
     );
   });
@@ -406,12 +423,12 @@ describe("sql layout", () => {
 
   it("preserves keyword case when keywordCase is preserve (#11382)", async () => {
     const sql = lines("select id as emp_id, name as emp_name", "from employees", "where status = 1 and dept = 'sales'", "order by id desc", "limit 10;");
-    expect(await format(sql, { keywordCase: "preserve" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
+    expect(await format(sql, { keywordCase: "preserve", logicalOperatorNewline: "before" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
   });
 
   it("converts keyword case to lower when keywordCase is lower (#11382)", async () => {
     const sql = lines("SELECT id AS emp_id, name AS emp_name", "FROM employees", "WHERE status = 1 AND dept = 'sales'", "ORDER BY id DESC", "LIMIT 10;");
-    expect(await format(sql, { keywordCase: "lower" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
+    expect(await format(sql, { keywordCase: "lower", logicalOperatorNewline: "before" })).toBe(lines("select id   as emp_id,", "       name as emp_name", "from employees", "where status = 1", "      and dept = 'sales'", "order by id desc", "limit 10;"));
   });
 
   it("preserves keyword case in join, union, case expression and ddl (#11382)", async () => {

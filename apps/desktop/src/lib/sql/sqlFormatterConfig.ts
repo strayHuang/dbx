@@ -87,7 +87,7 @@ export const DEFAULT_SQL_FORMATTER_SETTINGS: SqlFormatterSettings = {
   indentStyle: "standard",
   useTabs: false,
   tabWidth: 2,
-  logicalOperatorNewline: "before",
+  logicalOperatorNewline: "none",
   commaPosition: "after",
   fromClauseLayout: "sameLine",
   expressionWidth: 120,

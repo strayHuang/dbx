@@ -231,8 +231,7 @@ WHERE STATUS = 'ACTIVE';`;
        ctt.level_num,
        ctt.create_time
 FROM cte_test ctt
-WHERE ctt.status = 'A'
-      AND ctt.deleted = 0
+WHERE ctt.status = 'A' AND ctt.deleted = 0
 START WITH ctt.su_dm IN ('16', '17', '18')
 CONNECT BY PRIOR ctt.u_dm = ctt.su_dm;`);
   });
@@ -575,15 +574,10 @@ LIMIT 100;`);
     await expect(formatSqlText(`< 10`, "postgres")).resolves.toBe(`< 10`);
     // A short fragment collapses like any other short statement.
     await expect(formatSqlText(`< 10 AND score > 2`, "postgres")).resolves.toBe(`< 10 AND score > 2`);
-    // A wider one has no clause to lay out, so it falls back to sql-formatter's
-    // own operand-per-line rendering of a fragment rather than the clause rules.
+    // A wider one has no clause to lay out, and the default `none` keeps the
+    // whole condition on one line however long it gets.
     await expect(formatSqlText(`< 10 AND score > 2 AND status = 'active' AND deleted_at IS NULL AND created_at > now() - interval '30 days' AND owner_id = 42`, "postgres")).resolves.toBe(
-      `< 10
-AND score > 2
-AND status = 'active'
-AND deleted_at IS NULL
-AND created_at > now() - interval '30 days'
-AND owner_id = 42`,
+      `< 10 AND score > 2 AND status = 'active' AND deleted_at IS NULL AND created_at > now() - interval '30 days' AND owner_id = 42`,
     );
   });
 
@@ -693,16 +687,17 @@ AND owner_id = 42`,
  * `layoutStyle: "classic"` selects sql-formatter's own layout — the default
  * before v0.6.16 replaced it with DBX's printer — so these expectations are the
  * byte-for-byte output of the verbatim v0.6.15 `formatSqlText` (issue #11228).
- * The layout engine alone is not a v0.6.15 reproduction: v0.6.16 also changed
- * the `expressionWidth` and `fromClauseLayout` defaults, so both are set back
- * explicitly. The remaining options already match the v0.6.15 defaults.
+ * The layout engine alone is not a v0.6.15 reproduction: later releases also
+ * changed the `expressionWidth`, `fromClauseLayout` and
+ * `logicalOperatorNewline` defaults, so all three are set back explicitly. The
+ * remaining options already match the v0.6.15 defaults.
  *
  * Regenerate with `git show 455117b8c5^:apps/desktop/src/lib/sql/sqlFormatter.ts`
  * imported into a throwaway spec and called with these settings; the goldens
  * below are literals on purpose so the spec never depends on the old source.
  */
 describe("classic layout style (v0.6.15 reproduction)", () => {
-  const classic: Partial<SqlFormatterSettings> = { layoutStyle: "classic", expressionWidth: 50, fromClauseLayout: "newLine" };
+  const classic: Partial<SqlFormatterSettings> = { layoutStyle: "classic", expressionWidth: 50, fromClauseLayout: "newLine", logicalOperatorNewline: "before" };
   const lines = (...rows: string[]) => rows.join("\n");
 
   it("reproduces a MySQL SELECT with a JOIN", async () => {

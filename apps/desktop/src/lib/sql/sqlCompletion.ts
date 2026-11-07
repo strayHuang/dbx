@@ -1700,6 +1700,8 @@ export interface SqlCompletionContext {
   followingKeyword?: string;
   contextKind: SqlCompletionContextKind;
   dataTypeContext: boolean;
+  /** PostgreSQL-family `value::type` cast target, where only data types are valid. */
+  castTypeContext: boolean;
 }
 
 const SQL_COMPLETION_CLOSING_QUOTES: Readonly<Record<string, SqlCompletionClosingQuote>> = {
@@ -1905,6 +1907,10 @@ class SqlCompletionProvider {
       return dedupeAndSort(buildMongoCompletionItemsFromContext({ mode: "root", prefix: context.prefix, from: 0 }).map(mongoCompletionItemToSqlCompletionItem));
     }
 
+    if (context.castTypeContext) {
+      return dedupeAndSort(buildPostgresCastTypeItems(context.prefix, this.input.keywordCase));
+    }
+
     const snippets = this.databaseType === "manticoresearch" ? [...(this.input.snippets ?? DEFAULT_SQL_SNIPPETS), ...MANTICORESEARCH_SQL_SNIPPETS] : (this.input.snippets ?? DEFAULT_SQL_SNIPPETS);
     const customSnippetItems = buildSnippetItems(
       context.prefix,
@@ -2087,6 +2093,7 @@ export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options
   }
   if (context.exclusiveColumnSuggestions || shouldAutoOpenColumnCompletion(context, beforeCursor, beforeCursor.length, options.databaseType)) return true;
   if (context.dataTypeContext) return true;
+  if (context.castTypeContext) return true;
   return /[A-Za-z_$@.\p{Script=Han}]/u.test(previousChar) && context.prefix.length > 0;
 }
 
@@ -2893,6 +2900,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   const inCallRoutineContext = isCallRoutineContext(beforeCursor);
   const inPotentialPackageMemberContext = !!qualifier && !exclusiveTableSuggestions && !insertInfo && !updateInfo?.inSetClause && !oracleTableFunctionContext;
   const dataTypeContext = isColumnDataTypeContext(beforeToken, options.databaseType);
+  const castTypeContext = !dataTypeContext && isPostgresCastTypeContext(beforeToken, options.databaseType);
   const suggestColumns = !dataTypeContext && (!!qualifier || !!updateInfo?.inSetClause || !!insertInfo || (inColumnContext && referencedTables.length > 0));
   const suggestRoutines = !dataTypeContext && (inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && !updateInfo?.inSetClause && prefix.length >= 2));
 
@@ -2960,6 +2968,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
     followingKeyword: getFollowingKeywordAfterCursor(sql, cursor, statementSpan.end),
     contextKind,
     dataTypeContext,
+    castTypeContext,
   };
 }
 
@@ -3078,6 +3087,12 @@ function sqlServerDatepartCompletionValues(beforeCursor: string, databaseType?: 
 const POSTGRES_DATEPART_VALUES = ["microseconds", "milliseconds", "second", "minute", "hour", "day", "week", "month", "quarter", "year", "decade", "century", "millennium", "dow", "isodow", "doy", "isoyear", "epoch", "julian", "timezone", "timezone_hour", "timezone_minute"];
 
 const POSTGRES_DATE_TRUNC_VALUES = ["microseconds", "milliseconds", "second", "minute", "hour", "day", "week", "month", "quarter", "year", "decade", "century", "millennium"];
+
+/** PostgreSQL-family `value::type`: the token before the cursor ends at the cast operator. */
+function isPostgresCastTypeContext(beforeToken: string, databaseType?: DatabaseType): boolean {
+  if (databaseType === undefined || !(POSTGRES_COMPAT_FUNCTION_DATABASES.has(databaseType) || databaseType === "duckdb")) return false;
+  return /::\s*$/.test(beforeToken);
+}
 
 function postgresDatepartCompletionValues(beforeCursor: string, databaseType?: DatabaseType): string[] | undefined {
   if (databaseType === undefined || !POSTGRES_COMPAT_FUNCTION_DATABASES.has(databaseType)) return undefined;
@@ -6632,6 +6647,16 @@ function buildJoinModifierKeywordItems(prefix: string, keywordCase?: SqlKeywordC
 
 function isPendingJoinKeywordContext(context: SqlCompletionContext): boolean {
   return !context.prefix && context.preferredKeywords.includes("JOIN") && !!context.tableTriggerWord && JOIN_MODIFIERS.has(context.tableTriggerWord);
+}
+
+/** A PostgreSQL `value::type` cast target accepts data types only. */
+function buildPostgresCastTypeItems(prefix: string, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+  return POSTGRES_TYPE_KEYWORDS.filter((type) => matchesPrefix(type, prefix)).map((type) => ({
+    label: applySqlKeywordCase(type, keywordCase),
+    type: "keyword" as const,
+    detail: "data type",
+    boost: computeBoost(type, prefix) + 2500,
+  }));
 }
 
 function buildKeywordItems(prefix: string, context: SqlCompletionContext, databaseType?: DatabaseType, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
