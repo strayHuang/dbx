@@ -504,8 +504,10 @@ export async function formatSqlText(sql: string, dialect: SqlFormatDialect = "ge
   // the public formatter", which is also what the `classic` layout style asks
   // for: that style is sql-formatter's own layout, i.e. the pre-v0.6.16 default,
   // and the applySqlFormatterLayout post-passes exist to serve it. The tabular
-  // indent styles likewise are an alternative layout this printer deliberately
-  // does not reproduce.
+  // indent styles are a classic-layout detail (they pad clause keywords to a
+  // fixed column); they must not disable the printer, because that would skip
+  // every DBX rule — including keeping a value list on one line — whenever a
+  // user has tabular padding selected.
   const layoutOptions: Partial<SqlLayoutOptions> = {
     lineWidth: normalizedSettings.expressionWidth,
     indentWidth: normalizedSettings.tabWidth,
@@ -517,7 +519,7 @@ export async function formatSqlText(sql: string, dialect: SqlFormatDialect = "ge
     commaPosition: normalizedSettings.commaPosition,
     newlineBeforeSemicolon: normalizedSettings.newlineBeforeSemicolon,
   };
-  const usesDefaultStyle = normalizedSettings.layoutStyle === "dbx" && normalizedSettings.indentStyle === "standard";
+  const usesDefaultStyle = normalizedSettings.layoutStyle === "dbx";
 
   const formatOnce = async (input: string): Promise<string> => {
     const laidOut = usesDefaultStyle ? await formatSqlLayout({ sql: input, language, dialectOptions: resolvedDialect, cfg: formatterOptions, options: layoutOptions }) : null;

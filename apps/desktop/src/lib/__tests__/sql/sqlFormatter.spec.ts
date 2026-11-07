@@ -676,7 +676,9 @@ LIMIT 100;`);
 
   it("preserves line comments when formatting with leading comma position", async () => {
     const sql = "SELECT\n  col1, -- first column\n  col2 -- second column\nFROM tbl;";
-    const formatted = await formatSqlText(sql, "generic", { commaPosition: "before", indentStyle: "tabularLeft" });
+    // The leading-comma pass serves sql-formatter's classic layout; the DBX
+    // printer has its own leading-comma handling.
+    const formatted = await formatSqlText(sql, "generic", { layoutStyle: "classic", commaPosition: "before", indentStyle: "tabularLeft" });
 
     expect(formatted).toContain("col1 -- first column");
     expect(formatted).toMatch(/,\s*col2\s*-- second column/);

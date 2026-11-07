@@ -195,6 +195,16 @@ describe("sql layout", () => {
     expect(await format(sql, {}, "postgres")).toBe(`SELECT *\nFROM t\nWHERE t.ship_entry = ANY (ARRAY[${values}]);`);
   });
 
+  it("keeps a long ANY(ARRAY[...]) condition on one line with a tabular indent style", async () => {
+    const values = Array.from({ length: 38 }, (_, index) => index * 2 + 3).join(", ");
+    const sql = `SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id AND t1.shp_entry = ANY(ARRAY[${values}]);`;
+
+    // The tabular indent styles are a classic-layout detail; selecting one must
+    // not hand the whole input to sql-formatter, which expands the value list one
+    // value per line and breaks the join condition.
+    expect(await format(sql, { indentStyle: "tabularLeft" }, "postgres")).toBe(`SELECT a\nFROM t1\n    INNER JOIN t2 ON t1.id = t2.id AND t1.shp_entry = ANY (ARRAY[${values}]);`);
+  });
+
   it("keeps a small subquery inline", async () => {
     expect(await format("SELECT * FROM t WHERE id IN (SELECT id FROM u WHERE a = 1 AND b = 2);")).toBe("SELECT * FROM t WHERE id IN (SELECT id FROM u WHERE a = 1 AND b = 2);");
   });
@@ -338,11 +348,11 @@ describe("sql layout", () => {
     expect(await format(lines("-- heading", "", "SELECT a FROM t;"), { preserveEmptyLines: true })).toBe(lines("-- heading", "", "SELECT a", "FROM t;"));
   });
 
-  it("falls back to sql-formatter for the tabular indent styles", async () => {
-    // The tabular layouts pad every clause to a fixed column; the default
-    // layout rules do not reproduce them, so those settings keep the upstream
-    // formatter.
-    expect(await format("SELECT a, b FROM t WHERE x = 1;", { indentStyle: "tabularLeft" })).toBe(lines("SELECT    a,", "          b", "FROM      t", "WHERE     x = 1;"));
+  it("ignores the tabular indent styles under the dbx layout style", async () => {
+    // Tabular padding belongs to sql-formatter's classic layout. Selecting it
+    // must not bypass the DBX rules (it used to fall back to the upstream
+    // formatter, which expanded value lists one value per line).
+    expect(await format("SELECT a, b FROM t WHERE x = 1;", { indentStyle: "tabularLeft" })).toBe(lines("SELECT a,", "       b", "FROM t", "WHERE x = 1;"));
   });
 
   it("keeps every branch of a union whose operands are parenthesized (#10472)", async () => {
