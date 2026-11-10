@@ -1908,7 +1908,7 @@ class SqlCompletionProvider {
     }
 
     if (context.castTypeContext) {
-      return dedupeAndSort(buildPostgresCastTypeItems(context.prefix, this.input.keywordCase));
+      return dedupeAndSort(buildCastTypeItems(context.prefix, this.databaseType, this.input.keywordCase));
     }
 
     const snippets = this.databaseType === "manticoresearch" ? [...(this.input.snippets ?? DEFAULT_SQL_SNIPPETS), ...MANTICORESEARCH_SQL_SNIPPETS] : (this.input.snippets ?? DEFAULT_SQL_SNIPPETS);
@@ -2900,7 +2900,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   const inCallRoutineContext = isCallRoutineContext(beforeCursor);
   const inPotentialPackageMemberContext = !!qualifier && !exclusiveTableSuggestions && !insertInfo && !updateInfo?.inSetClause && !oracleTableFunctionContext;
   const dataTypeContext = isColumnDataTypeContext(beforeToken, options.databaseType);
-  const castTypeContext = !dataTypeContext && isPostgresCastTypeContext(beforeToken, options.databaseType);
+  const castTypeContext = !dataTypeContext && isCastTypeTargetContext(beforeCursor, beforeToken, options.databaseType);
   const suggestColumns = !dataTypeContext && (!!qualifier || !!updateInfo?.inSetClause || !!insertInfo || (inColumnContext && referencedTables.length > 0));
   const suggestRoutines = !dataTypeContext && (inCallRoutineContext || oracleTableFunctionContext || inPotentialPackageMemberContext || (!exclusiveTableSuggestions && !exclusiveColumnSuggestions && !insertInfo && !updateInfo?.inSetClause && prefix.length >= 2));
 
@@ -3088,10 +3088,26 @@ const POSTGRES_DATEPART_VALUES = ["microseconds", "milliseconds", "second", "min
 
 const POSTGRES_DATE_TRUNC_VALUES = ["microseconds", "milliseconds", "second", "minute", "hour", "day", "week", "month", "quarter", "year", "decade", "century", "millennium"];
 
-/** PostgreSQL-family `value::type`: the token before the cursor ends at the cast operator. */
-function isPostgresCastTypeContext(beforeToken: string, databaseType?: DatabaseType): boolean {
-  if (databaseType === undefined || !(POSTGRES_COMPAT_FUNCTION_DATABASES.has(databaseType) || databaseType === "duckdb")) return false;
-  return /::\s*$/.test(beforeToken);
+const CAST_AS_TYPE_FUNCTIONS = new Set(["CAST", "TRY_CAST", "PARSE"]);
+
+// SQL Server puts the target type first: `CONVERT(type, value[, style])`.
+const SQLSERVER_TYPE_FIRST_FUNCTIONS = new Set(["CONVERT", "TRY_CONVERT"]);
+
+/**
+ * The type slot of a conversion: `value::type`, `CAST(value AS type)`, `CONVERT(type, value)`.
+ * Only this slot accepts type names; every other argument keeps normal column completion, so
+ * `CONVERT(int, ` still completes columns instead of a type.
+ */
+function isCastTypeTargetContext(beforeCursor: string, beforeToken: string, databaseType?: DatabaseType): boolean {
+  if (databaseType === undefined) return false;
+  if ((POSTGRES_COMPAT_FUNCTION_DATABASES.has(databaseType) || databaseType === "duckdb") && /::\s*$/.test(beforeToken)) return true;
+
+  const call = findActiveFunctionCall(beforeCursor);
+  if (!call) return false;
+  const name = call.name.toUpperCase();
+  if (CAST_AS_TYPE_FUNCTIONS.has(name)) return /(?:^|\s)as\s*$/i.test(call.groupText);
+  if (databaseType === "sqlserver" && SQLSERVER_TYPE_FIRST_FUNCTIONS.has(name)) return countTopLevelCommas(call.groupText) === 0;
+  return false;
 }
 
 function postgresDatepartCompletionValues(beforeCursor: string, databaseType?: DatabaseType): string[] | undefined {
@@ -3789,10 +3805,28 @@ const TABLE_REF_QUOTED_IDENTIFIER = `(?:"[^"]+"|\`[^\`]+\`|\\[[^\\]]+\\])`;
 // regex has a single source of truth instead of an inline copy.
 const TABLE_REF_INTRODUCER_KEYWORDS = ["from", "join", "straight_join", "update", "apply"];
 
+// A table hint written between the table name and its alias, e.g. SQL Server's
+// `OSHP(nolock)` / `OSHP WITH (NOLOCK)` / `OSHP WITH (INDEX(ix_a), NOLOCK)`.
+// Without this the alias after the hint was never captured, so `alias.` produced no columns.
+// One nesting level is enough for `INDEX(...)`-style hints.
+const TABLE_REF_HINT = `(?:\\s*(?:with\\s*)?\\((?:[^()]|\\([^()]*\\))*\\))?`;
+
 function buildTableRefPattern(unquotedIdentifier: string, aliasIdentifier: string, allowSqlServerDoubleDot: boolean): RegExp {
   const identifier = `(?:${TABLE_REF_QUOTED_IDENTIFIER}|${unquotedIdentifier})`;
   const qualifiedSeparator = allowSqlServerDoubleDot ? `\\.(?:${identifier}|\\.${identifier})` : `\\.${identifier}`;
-  return new RegExp(`\\b(?:${TABLE_REF_INTRODUCER_KEYWORDS.join("|")})\\s+(${identifier}(?:${qualifiedSeparator}){0,3})(?:\\s+(?:as\\s+)?(${aliasIdentifier}))?`, "giu");
+  return new RegExp(`\\b(?:${TABLE_REF_INTRODUCER_KEYWORDS.join("|")})\\s+(${identifier}(?:${qualifiedSeparator}){0,3})${TABLE_REF_HINT}(?:\\s+(?:as\\s+)?(${aliasIdentifier}))?`, "giu");
+}
+
+/**
+ * The next entry of a comma-separated table list (`FROM a x, b (nolock) y`). The primary
+ * pattern only anchors on an introducer keyword, so every entry after the first one was
+ * invisible to alias and column completion. This pattern must start with a comma, which keeps
+ * it inside the table list instead of matching select-list or function-argument commas.
+ */
+function buildTableListEntryPattern(unquotedIdentifier: string, aliasIdentifier: string, allowSqlServerDoubleDot: boolean): RegExp {
+  const identifier = `(?:${TABLE_REF_QUOTED_IDENTIFIER}|${unquotedIdentifier})`;
+  const qualifiedSeparator = allowSqlServerDoubleDot ? `\\.(?:${identifier}|\\.${identifier})` : `\\.${identifier}`;
+  return new RegExp(`\\s*,\\s*(${identifier}(?:${qualifiedSeparator}){0,3})${TABLE_REF_HINT}(?:\\s+(?:as\\s+)?(${aliasIdentifier}))?`, "giu");
 }
 
 // Precompiled once at module load (not per extractReferencedTables call) since this runs on
@@ -3800,6 +3834,9 @@ function buildTableRefPattern(unquotedIdentifier: string, aliasIdentifier: strin
 const TABLE_REF_PATTERN_ASCII = buildTableRefPattern(TABLE_REF_UNQUOTED_IDENTIFIER_ASCII, TABLE_REF_ALIAS_ASCII, false);
 const TABLE_REF_PATTERN_UNICODE_DEFAULT = buildTableRefPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, false);
 const TABLE_REF_PATTERN_UNICODE_SQLSERVER = buildTableRefPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, true);
+const TABLE_LIST_ENTRY_PATTERN_ASCII = buildTableListEntryPattern(TABLE_REF_UNQUOTED_IDENTIFIER_ASCII, TABLE_REF_ALIAS_ASCII, false);
+const TABLE_LIST_ENTRY_PATTERN_UNICODE_DEFAULT = buildTableListEntryPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, false);
+const TABLE_LIST_ENTRY_PATTERN_UNICODE_SQLSERVER = buildTableListEntryPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, true);
 
 /**
  * Masks string literals and comments so keyword/table-reference scanning never mistakes text
@@ -4016,6 +4053,7 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
   // An unresolved databaseType (e.g. a scratch editor before a connection is picked) also defaults
   // to ASCII-only, matching this function's behavior before dialect-aware Unicode matching existed.
   const pattern = !databaseType || ASCII_ONLY_UNQUOTED_IDENTIFIER_DATABASES.has(databaseType) ? TABLE_REF_PATTERN_ASCII : databaseType === "sqlserver" ? TABLE_REF_PATTERN_UNICODE_SQLSERVER : TABLE_REF_PATTERN_UNICODE_DEFAULT;
+  const listEntryPattern = !databaseType || ASCII_ONLY_UNQUOTED_IDENTIFIER_DATABASES.has(databaseType) ? TABLE_LIST_ENTRY_PATTERN_ASCII : databaseType === "sqlserver" ? TABLE_LIST_ENTRY_PATTERN_UNICODE_SQLSERVER : TABLE_LIST_ENTRY_PATTERN_UNICODE_DEFAULT;
   // These are shared module-level RegExp objects (built once for performance), so reset
   // lastIndex before each scan rather than relying on a fresh object per call.
   pattern.lastIndex = 0;
@@ -4024,36 +4062,49 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
   // maskSqlLiteralsAndComments), so the returned table info built from `match` is unaffected.
   const scanSql = maskSqlLiteralsAndComments(sql, databaseType);
   const referenced: SqlCompletionReferencedTable[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(scanSql)) !== null) {
-    const rawName = match[1];
-    const alias = match[2];
-    if (alias && ALIAS_BLACKLIST.has(alias.toLowerCase())) {
-      pattern.lastIndex = match.index + match[0].length - alias.length;
-    }
+
+  const addReference = (rawName: string | undefined, alias: string | undefined): void => {
     const quotedName = !!rawName && (rawName.startsWith('"') || rawName.startsWith("`") || rawName.startsWith("["));
-    if (!quotedName && rawName && ALIAS_BLACKLIST.has(rawName.toLowerCase())) continue;
+    if (!quotedName && rawName && ALIAS_BLACKLIST.has(rawName.toLowerCase())) return;
     // Filter out SQL keywords that accidentally matched as aliases
     const cleanAlias = alias && !ALIAS_BLACKLIST.has(alias.toLowerCase()) ? alias : undefined;
     if (isElasticsearchStyleIndexName(rawName)) {
       referenced.push({ name: unquoteIdentifier(rawName), alias: cleanAlias });
-      continue;
+      return;
     }
-    const rawParts = splitQualifiedNameRawParts(rawName);
+    const rawParts = splitQualifiedNameRawParts(rawName ?? "");
     const omittedSqlServerSchema = databaseType === "sqlserver" && rawParts.length >= 3 && rawParts[rawParts.length - 2] === "";
     const unquotedRawParts = rawParts.map((part) => completionLookupIdentifier(part, databaseType));
     const parts = unquotedRawParts.filter(Boolean);
     const name = unquotedRawParts[unquotedRawParts.length - 1];
-    if (!name) continue;
-    const table: SqlCompletionReferencedTable = {
+    if (!name) return;
+    referenced.push({
       name,
       nameQuoted: isQuotedIdentifier(rawParts[rawParts.length - 1]),
       database: omittedSqlServerSchema ? unquotedRawParts[unquotedRawParts.length - 3] || undefined : parts.length >= 3 ? parts[parts.length - 3] : undefined,
       schema: omittedSqlServerSchema ? SQLSERVER_DEFAULT_SCHEMA : parts.length >= 2 ? parts[parts.length - 2] : undefined,
       schemaQuoted: omittedSqlServerSchema ? undefined : parts.length >= 2 ? isQuotedIdentifier(rawParts[rawParts.length - 2]) : undefined,
       alias: cleanAlias,
-    };
-    referenced.push(table);
+    });
+  };
+
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(scanSql)) !== null) {
+    const alias = match[2];
+    if (alias && ALIAS_BLACKLIST.has(alias.toLowerCase())) {
+      pattern.lastIndex = match.index + match[0].length - alias.length;
+    }
+    const quotedName = !!match[1] && (match[1].startsWith('"') || match[1].startsWith("`") || match[1].startsWith("["));
+    if (!quotedName && match[1] && ALIAS_BLACKLIST.has(match[1].toLowerCase())) continue;
+    addReference(match[1], alias);
+
+    // Walk the rest of a comma-separated table list (`FROM a x, b (nolock) y`): the primary
+    // pattern only anchors on the introducer, so later entries need their own scan.
+    listEntryPattern.lastIndex = pattern.lastIndex;
+    let entry: RegExpExecArray | null;
+    while ((entry = listEntryPattern.exec(scanSql)) !== null) {
+      addReference(entry[1], entry[2]);
+    }
   }
   return referenced;
 }
@@ -6649,14 +6700,19 @@ function isPendingJoinKeywordContext(context: SqlCompletionContext): boolean {
   return !context.prefix && context.preferredKeywords.includes("JOIN") && !!context.tableTriggerWord && JOIN_MODIFIERS.has(context.tableTriggerWord);
 }
 
-/** A PostgreSQL `value::type` cast target accepts data types only. */
-function buildPostgresCastTypeItems(prefix: string, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
-  return POSTGRES_TYPE_KEYWORDS.filter((type) => matchesPrefix(type, prefix)).map((type) => ({
-    label: applySqlKeywordCase(type, keywordCase),
-    type: "keyword" as const,
-    detail: "data type",
-    boost: computeBoost(type, prefix) + 2500,
-  }));
+/** A `value::type` cast target accepts data types only. */
+function buildCastTypeItems(prefix: string, databaseType: DatabaseType | undefined, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
+  // Cast targets are dialect specific: `NVARCHAR` is not a PostgreSQL type, and `JSONB` is not
+  // a SQL Server one. Unknown/other dialects fall back to the merged catalog.
+  const types = databaseType === "sqlserver" ? SQLSERVER_TYPE_KEYWORDS : databaseType !== undefined && (POSTGRES_COMPAT_FUNCTION_DATABASES.has(databaseType) || databaseType === "duckdb") ? POSTGRES_TYPE_KEYWORDS : [...DATA_TYPE_KEYWORDS];
+  return types
+    .filter((type) => matchesPrefix(type, prefix))
+    .map((type) => ({
+      label: applySqlKeywordCase(type, keywordCase),
+      type: "keyword" as const,
+      detail: "data type",
+      boost: computeBoost(type, prefix) + 2500,
+    }));
 }
 
 function buildKeywordItems(prefix: string, context: SqlCompletionContext, databaseType?: DatabaseType, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {

@@ -63,6 +63,18 @@ describe("PostgreSQL 18 completion catalog", () => {
     expect(shouldAutoOpenSqlCompletion(sql, sql.length, POSTGRES_OPTIONS)).toBe(true);
   });
 
+  it("suggests the target type in the CAST type slot only", () => {
+    const typeSlot = labelsFor("SELECT CAST(t.id AS ");
+    expect(typeSlot).toContain("JSONB");
+    expect(typeSlot).not.toContain("SELECT");
+
+    // The value slot of CAST keeps the normal expression completion instead of the type-only list.
+    expect(labelsFor("SELECT CAST(")).toContain("COUNT");
+
+    // `::` keeps working (the type-only path was shared with CAST).
+    expect(labelsFor("SELECT t.id::")).toContain("JSONB");
+  });
+
   it("suggests date/time field values inside DATE_TRUNC and EXTRACT", () => {
     const truncLabels = labelsFor("SELECT DATE_TRUNC(");
     expect(truncLabels).toContain("MONTH");

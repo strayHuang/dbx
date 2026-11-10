@@ -12,6 +12,25 @@ function labelsFor(sql: string) {
   return buildSqlCompletionItems(sql, sql.length, SQLSERVER_OPTIONS).map((item) => item.label);
 }
 
+const SQLSERVER_TABLE_OPTIONS = {
+  databaseType: "sqlserver" as never,
+  tables: [{ name: "OSHP" }, { name: "OITB" }],
+  columnsByTable: new Map([
+    [
+      "oshp",
+      [
+        { name: "DocEntry", table: "OSHP" },
+        { name: "IsInvalid", table: "OSHP" },
+      ],
+    ],
+    ["oitb", [{ name: "ItmsGrpCod", table: "OITB" }]],
+  ]),
+};
+
+function tableLabelsFor(sql: string) {
+  return buildSqlCompletionItems(sql, sql.length, SQLSERVER_TABLE_OPTIONS).map((item) => item.label);
+}
+
 describe("SQL Server completion catalog", () => {
   it("ships the official reserved keywords, system variables and documented functions", () => {
     expect(SQLSERVER_KEYWORDS.length).toBeGreaterThan(180);
@@ -47,5 +66,34 @@ describe("SQL Server completion catalog", () => {
     expect(labelsFor("SELECT DATE_BUCKET(")).toContain("MONTH");
     expect(labelsFor("SELECT DATETRUNC(")).toContain("QUARTER");
     expect(labelsFor("SELECT DATEDIFF_BIG(")).toContain("DAYOFYEAR");
+  });
+
+  it("completes the target type only in the CONVERT type slot", () => {
+    const firstArgument = tableLabelsFor("SELECT CONVERT(");
+    expect(firstArgument).toContain("NVARCHAR");
+    expect(firstArgument).not.toContain("DocEntry");
+
+    // `CONVERT(type, value)`: the second argument is a value, so columns come back.
+    const sql = "SELECT CONVERT(NVARCHAR(50),  FROM OSHP s0";
+    expect(buildSqlCompletionItems(sql, sql.indexOf(",") + 1, SQLSERVER_TABLE_OPTIONS).map((item) => item.label)).toContain("DocEntry");
+  });
+
+  it("completes the target type in CAST, TRY_CAST, PARSE and TRY_CONVERT", () => {
+    for (const sql of ["SELECT CAST(CardCode AS ", "SELECT TRY_CAST(CardCode AS ", "SELECT PARSE(CardCode AS ", "SELECT TRY_CONVERT("]) {
+      const labels = tableLabelsFor(sql);
+      expect(labels).toContain("NVARCHAR");
+      expect(labels).not.toContain("DocEntry");
+    }
+
+    // The value argument of CAST keeps column completion.
+    const sql = "SELECT CAST(  FROM OSHP s0";
+    expect(buildSqlCompletionItems(sql, sql.indexOf("(") + 1, SQLSERVER_TABLE_OPTIONS).map((item) => item.label)).toContain("DocEntry");
+  });
+
+  it("resolves table aliases written after a NOLOCK table hint", () => {
+    const sql = "SELECT s0. s1. FROM OSHP(nolock) s0, OITB (nolock) s1";
+    expect(buildSqlCompletionItems(sql, sql.indexOf("s0.") + "s0.".length, SQLSERVER_TABLE_OPTIONS).map((item) => item.label)).toEqual(["DocEntry", "IsInvalid"]);
+
+    expect(buildSqlCompletionItems(sql, sql.indexOf("s1.") + "s1.".length, SQLSERVER_TABLE_OPTIONS).map((item) => item.label)).toEqual(["ItmsGrpCod"]);
   });
 });
