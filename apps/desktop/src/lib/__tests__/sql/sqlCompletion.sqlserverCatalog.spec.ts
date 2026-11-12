@@ -96,4 +96,21 @@ describe("SQL Server completion catalog", () => {
 
     expect(buildSqlCompletionItems(sql, sql.indexOf("s1.") + "s1.".length, SQLSERVER_TABLE_OPTIONS).map((item) => item.label)).toEqual(["ItmsGrpCod"]);
   });
+
+  it("resolves a reused alias to the table of the current parenthesis scope", () => {
+    const options = {
+      databaseType: "sqlserver" as never,
+      dialect: "sqlserver" as never,
+      tables: [{ name: "OETT" }, { name: "YValueDetail" }],
+      columnsByTable: new Map([
+        ["oett", [{ name: "dayTargetAmount", table: "OETT" }]],
+        ["yvaluedetail", [{ name: "priceOfDay", table: "YValueDetail" }]],
+      ]),
+    };
+    const sql = "(select x from OETT(nolock) t1)\nunion all\n(select t1. from YValueDetail(nolock) t1)";
+    const secondArm = buildSqlCompletionItems(sql, sql.indexOf("t1.") + "t1.".length, options).map((item) => item.label);
+
+    expect(secondArm).toContain("priceOfDay");
+    expect(secondArm).not.toContain("dayTargetAmount");
+  });
 });

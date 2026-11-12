@@ -1643,6 +1643,8 @@ export interface SqlCompletionReferencedTable {
   aliasSql?: string;
   columns?: string[];
   columnAliases?: string[];
+  /** Offset of the innermost enclosing `(` at the reference, or -1 when top-level. */
+  scopeStart?: number;
 }
 
 export type SqlStatementKind = "select" | "insert" | "update" | "delete" | "create" | "alter" | "drop" | "unknown";
@@ -2875,6 +2877,9 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
     }
   }
 
+  // 同名别名可能分散在 UNION 分支、嵌套子查询等不同括号作用域里，只保留光标可见的定义。
+  referencedTables = narrowReferencedTablesToCursorScope(referencedTables, fullStatement, cursorInStatement, options.databaseType);
+
   // Detect INSERT INTO table (column list) context
   const insertInfo = detectInsertColumnListContext(beforeCursor);
   const updateInfo = detectUpdateCompletionContext(beforeCursor);
@@ -4067,13 +4072,14 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
   const scanSql = maskSqlLiteralsAndComments(sql, databaseType);
   const referenced: SqlCompletionReferencedTable[] = [];
 
-  const addReference = (rawName: string | undefined, alias: string | undefined): void => {
+  const addReference = (rawName: string | undefined, alias: string | undefined, position?: number): void => {
     const quotedName = !!rawName && (rawName.startsWith('"') || rawName.startsWith("`") || rawName.startsWith("["));
     if (!quotedName && rawName && ALIAS_BLACKLIST.has(rawName.toLowerCase())) return;
     // Filter out SQL keywords that accidentally matched as aliases
     const cleanAlias = alias && !ALIAS_BLACKLIST.has(alias.toLowerCase()) ? alias : undefined;
+    const scopeStart = position === undefined ? undefined : enclosingParenStart(scanSql, position);
     if (isElasticsearchStyleIndexName(rawName)) {
-      referenced.push({ name: unquoteIdentifier(rawName), alias: cleanAlias });
+      referenced.push({ name: unquoteIdentifier(rawName), alias: cleanAlias, scopeStart });
       return;
     }
     const rawParts = splitQualifiedNameRawParts(rawName ?? "");
@@ -4089,6 +4095,7 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
       schema: omittedSqlServerSchema ? SQLSERVER_DEFAULT_SCHEMA : parts.length >= 2 ? parts[parts.length - 2] : undefined,
       schemaQuoted: omittedSqlServerSchema ? undefined : parts.length >= 2 ? isQuotedIdentifier(rawParts[rawParts.length - 2]) : undefined,
       alias: cleanAlias,
+      scopeStart,
     });
   };
 
@@ -4100,17 +4107,74 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
     }
     const quotedName = !!match[1] && (match[1].startsWith('"') || match[1].startsWith("`") || match[1].startsWith("["));
     if (!quotedName && match[1] && ALIAS_BLACKLIST.has(match[1].toLowerCase())) continue;
-    addReference(match[1], alias);
+    addReference(match[1], alias, match.index);
 
     // Walk the rest of a comma-separated table list (`FROM a x, b (nolock) y`): the primary
     // pattern only anchors on the introducer, so later entries need their own scan.
     listEntryPattern.lastIndex = pattern.lastIndex;
     let entry: RegExpExecArray | null;
     while ((entry = listEntryPattern.exec(scanSql)) !== null) {
-      addReference(entry[1], entry[2]);
+      addReference(entry[1], entry[2], entry.index);
     }
   }
   return referenced;
+}
+
+/** Offset of the innermost `(` enclosing `position`, or -1 when the position is top-level. */
+function enclosingParenStart(maskedSql: string, position: number): number {
+  const stack: number[] = [];
+  const limit = Math.min(position, maskedSql.length);
+  for (let i = 0; i < limit; i++) {
+    const ch = maskedSql[i];
+    if (ch === "(") stack.push(i);
+    else if (ch === ")" && stack.length > 0) stack.pop();
+  }
+  return stack.length > 0 ? stack[stack.length - 1] : -1;
+}
+
+/** Enclosing `(` offsets of the cursor, innermost first; -1 closes the chain for the whole statement. */
+function cursorScopeStarts(maskedSql: string, cursor: number): number[] {
+  const stack: number[] = [];
+  const limit = Math.min(cursor, maskedSql.length);
+  for (let i = 0; i < limit; i++) {
+    const ch = maskedSql[i];
+    if (ch === "(") stack.push(i);
+    else if (ch === ")" && stack.length > 0) stack.pop();
+  }
+  stack.push(-1);
+  return stack.reverse();
+}
+
+/**
+ * 同一别名可能在不同括号作用域里指向不同表（UNION 各分支、嵌套子查询）。此时只保留光标
+ * 可见作用域中最内层的那个定义，避免 `t1.` 同时列出两个分支里 t1 的字段。
+ */
+function narrowReferencedTablesToCursorScope(referencedTables: SqlCompletionReferencedTable[], sql: string, cursor: number, databaseType?: DatabaseType): SqlCompletionReferencedTable[] {
+  const byAlias = new Map<string, SqlCompletionReferencedTable[]>();
+  for (const table of referencedTables) {
+    if (!table.alias) continue;
+    const key = normalizeIdentifierPart(table.alias);
+    const list = byAlias.get(key);
+    if (list) list.push(table);
+    else byAlias.set(key, [table]);
+  }
+  const shadowed = [...byAlias.values()].filter((tables) => tables.length > 1);
+  if (shadowed.length === 0) return referencedTables;
+
+  const scopeStarts = cursorScopeStarts(maskSqlLiteralsAndComments(sql, databaseType), cursor);
+  const dropped = new Set<SqlCompletionReferencedTable>();
+  for (const tables of shadowed) {
+    let winner: SqlCompletionReferencedTable | undefined;
+    for (const scopeStart of scopeStarts) {
+      winner = tables.find((table) => (table.scopeStart ?? -1) === scopeStart);
+      if (winner) break;
+    }
+    if (!winner) continue;
+    for (const table of tables) {
+      if (table !== winner) dropped.add(table);
+    }
+  }
+  return dropped.size === 0 ? referencedTables : referencedTables.filter((table) => !dropped.has(table));
 }
 
 function isElasticsearchStyleIndexName(name: string | undefined): name is string {
@@ -6224,7 +6288,7 @@ function buildJoinConditionItemsForPair(
   const emittedPairs = new Set<string>();
 
   const addPair = (leftColumn: SqlCompletionColumn | undefined, rightColumn: SqlCompletionColumn | undefined, boost: number) => {
-    if (!leftColumn || !rightColumn || !areJoinColumnTypesCompatible(leftColumn, rightColumn)) return;
+    if (!leftColumn || !rightColumn) return;
     const key = `${leftColumn.name.toLowerCase()}:${rightColumn.name.toLowerCase()}`;
     if (emittedPairs.has(key)) return;
     emittedPairs.add(key);
@@ -6312,10 +6376,10 @@ function buildCompositeHeuristicJoinConditionItems(
   const candidates: Array<{ parent: "left" | "right"; parentId: SqlCompletionColumn; childFk: SqlCompletionColumn }> = [];
   const rightNamedFk = rightByName.get(`${leftTableKey}_id`)?.[0];
   const leftNamedFk = leftByName.get(`${rightTableKey}_id`)?.[0];
-  if (leftId && rightNamedFk && areJoinColumnTypesCompatible(leftId, rightNamedFk)) {
+  if (leftId && rightNamedFk) {
     candidates.push({ parent: "left", parentId: leftId, childFk: rightNamedFk });
   }
-  if (rightId && leftNamedFk && areJoinColumnTypesCompatible(leftNamedFk, rightId)) {
+  if (rightId && leftNamedFk) {
     candidates.push({ parent: "right", parentId: rightId, childFk: leftNamedFk });
   }
   if (candidates.length === 0) return [];
@@ -6324,7 +6388,7 @@ function buildCompositeHeuristicJoinConditionItems(
     .map((leftColumn) => {
       const name = leftColumn.name.toLowerCase();
       const rightColumn = rightByName.get(name)?.[0];
-      if (!rightColumn || !isLikelyScopeColumnName(name) || !areJoinColumnTypesCompatible(leftColumn, rightColumn)) {
+      if (!rightColumn || !isLikelyScopeColumnName(name)) {
         return null;
       }
       return { leftColumn, rightColumn };
@@ -6370,26 +6434,6 @@ function buildHeuristicJoinConditionPart(leftRef: string, leftApplyRef: string, 
 
 function isLikelyScopeColumnName(name: string): boolean {
   return name !== "id" && (name.endsWith("_id") || name === "tenant" || name === "tenant_id" || name === "account_id" || name === "workspace_id" || name === "organization_id" || name === "org_id");
-}
-
-function areJoinColumnTypesCompatible(left: SqlCompletionColumn, right: SqlCompletionColumn): boolean {
-  const leftType = normalizeJoinType(left.dataType);
-  const rightType = normalizeJoinType(right.dataType);
-  if (!leftType || !rightType) return true;
-  return leftType === rightType;
-}
-
-function normalizeJoinType(dataType?: string): string | null {
-  if (!dataType) return null;
-  const type = dataType.toLowerCase();
-  if (/\b(uuid|uniqueidentifier)\b/.test(type)) return "uuid";
-  if (/\b(bigint|int8|integer|int|int4|smallint|int2|tinyint|serial|bigserial|number|numeric|decimal)\b/.test(type)) {
-    return "number";
-  }
-  if (/\b(char|text|clob|string|varchar|nvarchar|nchar|uuid)\b/.test(type)) return "text";
-  if (/\b(bool|boolean|bit)\b/.test(type)) return "boolean";
-  if (/\b(date|time|timestamp|datetime)\b/.test(type)) return "temporal";
-  return type.replace(/\(.+\)/, "").trim() || null;
 }
 
 function singularTableName(name: string): string {

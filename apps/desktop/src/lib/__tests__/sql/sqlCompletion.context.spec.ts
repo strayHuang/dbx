@@ -2827,4 +2827,16 @@ describe("JOIN condition continuation after a written ON condition", () => {
 
     expect(foreignKey?.apply).toBe("o.user_id = u.id");
   });
+
+  it("offers same-name join conditions even when the column types differ", () => {
+    const mismatchedTypes = new Map([
+      ["users", [{ name: "id", table: "users", dataType: "uniqueidentifier" }]],
+      ["orders", [{ name: "user_id", table: "orders", dataType: "int" }]],
+    ]);
+    const sql = "select * from users u join orders o on ";
+    const context = sqlCompletionContextFromSemantic(buildSqlSemanticModel(sql, sql.length), getSqlCompletionContext(sql, sql.length));
+    const items = buildSqlCompletionItemsFromContext(context, { tables: [], columnsByTable: mismatchedTypes });
+
+    expect(items.some((item) => item.label === "u.id = o.user_id")).toBe(true);
+  });
 });
