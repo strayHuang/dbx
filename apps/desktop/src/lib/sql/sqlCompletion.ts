@@ -2100,6 +2100,10 @@ export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options
 function shouldAutoOpenColumnCompletion(context: SqlCompletionContext, sql: string, cursor: number, databaseType: DatabaseType | undefined): boolean {
   if (!context.suggestColumns || context.referencedTables.length === 0) return false;
   if (context.prefix.length > 0) return true;
+  // 空格边界：光标前紧邻空白的列补全只允许由"关键字 + 空格"（from / where / and / on …）
+  // 这类规则触发。`select a, |`、`select sum(x) |`、`= |` 之后的空格说明当前表达式已经
+  // 写完，此时不自动弹出（否则继续输入时极易误选第一项 from 等关键字）。
+  if (/[ \t]$/.test(sql.slice(0, cursor))) return false;
   if (context.selectListColumnContext) return true;
   return isColumnCompletionExpressionStart(sql.slice(0, cursor), databaseType);
 }

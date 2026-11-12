@@ -1816,6 +1816,31 @@ describe("sqlCompletion scoped context classification", () => {
     expect(shouldAutoOpenSqlCompletion(sql, cursor)).toBe(true);
   });
 
+  it("does not auto-open on the space that ends a finished select-list expression", () => {
+    const sql = "SELECT t1.id, sum(t1.total), \nFROM t1\n  JOIN t2 ON t2.id = t1.id";
+    const cursor = sql.indexOf("\n");
+    const options = { databaseType: "mysql" } as const;
+
+    expect(getSqlCompletionContext(sql, cursor, options).selectListColumnContext).toBe(true);
+    expect(shouldAutoOpenSqlCompletion(sql, cursor, options)).toBe(false);
+  });
+
+  it("does not auto-open on the space after a complete select-list item", () => {
+    const options = { databaseType: "mysql" } as const;
+    const aliasSql = "SELECT t1.id AS x \nFROM t1";
+    const itemSql = "SELECT sum(t1.total) \nFROM t1";
+
+    expect(shouldAutoOpenSqlCompletion(aliasSql, "SELECT t1.id AS x ".length, options)).toBe(false);
+    expect(shouldAutoOpenSqlCompletion(itemSql, "SELECT sum(t1.total) ".length, options)).toBe(false);
+  });
+
+  it("still auto-opens on the space after a clause keyword", () => {
+    const options = { databaseType: "mysql" } as const;
+    for (const sql of ["SELECT * FROM ", "SELECT *\nFROM t1\nWHERE ", "SELECT *\nFROM t1\nWHERE id = 1 AND ", "SELECT * FROM t1 ORDER BY "]) {
+      expect(shouldAutoOpenSqlCompletion(sql, sql.length, options), sql).toBe(true);
+    }
+  });
+
   it("does not let a trailing comment's stray 'and'/'or' text suppress the AND/OR keyword suggestion", () => {
     const sql = "SELECT * FROM t WHERE id = 1 # mentions where and or\n";
     const context = getSqlCompletionContext(sql, sql.length, { databaseType: "mysql" });
