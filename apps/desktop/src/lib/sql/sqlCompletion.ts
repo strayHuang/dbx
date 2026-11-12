@@ -2089,7 +2089,9 @@ export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options
     return false;
   }
   if (previousChar === "(" && (context.insertTable || context.preferredValueKeywords?.length)) return true;
-  if (/[,;()[\]]/.test(previousChar)) return false;
+  // 逗号边界：select 列表/where 条件里刚输入 `,` 时立即弹出当前作用域的字段（和 FROM 表列表）。
+  if (previousChar === ",") return (context.suggestColumns && context.referencedTables.length > 0) || context.exclusiveTableSuggestions;
+  if (/[;()[\]]/.test(previousChar)) return false;
   if (context.exclusiveTableSuggestions || context.exclusiveRoutineSuggestions || context.suggestTables) {
     return true;
   }
@@ -2879,6 +2881,9 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
 
   // 同名别名可能分散在 UNION 分支、嵌套子查询等不同括号作用域里，只保留光标可见的定义。
   referencedTables = narrowReferencedTablesToCursorScope(referencedTables, fullStatement, cursorInStatement, options.databaseType);
+  // 字段补全只能看到光标所在作用域的表：外层查询的派生表、兄弟子查询里的表都不应
+  // 出现在内层 `SELECT ` / `t1.` 的候选里。
+  referencedTables = scopeReferencedTablesToCursor(referencedTables, fullStatement, cursorInStatement, options.databaseType);
 
   // Detect INSERT INTO table (column list) context
   const insertInfo = detectInsertColumnListContext(beforeCursor);
@@ -3847,6 +3852,16 @@ const TABLE_LIST_ENTRY_PATTERN_ASCII = buildTableListEntryPattern(TABLE_REF_UNQU
 const TABLE_LIST_ENTRY_PATTERN_UNICODE_DEFAULT = buildTableListEntryPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, false);
 const TABLE_LIST_ENTRY_PATTERN_UNICODE_SQLSERVER = buildTableListEntryPattern(TABLE_REF_UNQUOTED_IDENTIFIER_UNICODE, TABLE_REF_ALIAS_UNICODE, true);
 
+// A comma-separated table list ends at the next clause/join keyword. Precompiled for the same
+// per-keystroke hot path as the table patterns above.
+const TABLE_LIST_BOUNDARY_PATTERN = /\b(?:where|group|order|having|limit|offset|on|using|join|inner|left|right|full|cross|union|intersect|except|window|qualify|option)\b/gi;
+
+function tableListBoundaryIndex(sql: string, from: number): number {
+  TABLE_LIST_BOUNDARY_PATTERN.lastIndex = from;
+  const match = TABLE_LIST_BOUNDARY_PATTERN.exec(sql);
+  return match ? match.index! : sql.length;
+}
+
 /**
  * Masks string literals and comments so keyword/table-reference scanning never mistakes text
  * inside them for real SQL (e.g. `'from 测试表'` or `-- from 测试表`). Built on
@@ -3898,7 +3913,7 @@ const TABLE_LIST_ENTRY_PATTERN_UNICODE_SQLSERVER = buildTableListEntryPattern(TA
  * single space -- getting trimmed away and exposing the real preceding tail is the correct
  * behavior there (already covered by existing tests).
  */
-function maskSqlLiteralsAndComments(sql: string, databaseType?: DatabaseType): string {
+function maskSqlLiteralsAndComments(sql: string, databaseType?: DatabaseType, preserveLength = false): string {
   const dialectId = resolveSqlDialectId({ databaseType });
   const mysqlFamily = !!databaseType && MYSQL_DASH_COMMENT_DIALECTS.has(databaseType);
   const mysqlBackslashEscape = !!databaseType && BACKSLASH_ESCAPE_STRING_DIALECTS.has(databaseType);
@@ -3925,9 +3940,10 @@ function maskSqlLiteralsAndComments(sql: string, databaseType?: DatabaseType): s
     const isTableRefSegment = tableRefState === "expectSegment" && (t.kind === "quoted_identifier" || t.kind === "word");
     const maskAsValue = t.kind === "string" || (isDoubleQuotedIdentifier && (afterValueOperator || (mysqlFamily && !isTableRefSegment)));
     if (t.kind === "comment") {
-      out += " ";
+      out += preserveLength ? " ".repeat(t.span.end - t.span.start) : " ";
     } else if (maskAsValue) {
-      out += (t.quote ?? '"').repeat(2);
+      const masked = (t.quote ?? '"').repeat(2);
+      out += preserveLength ? masked.padEnd(t.span.end - t.span.start, " ") : masked;
     } else {
       out += sql.slice(t.span.start, t.span.end);
     }
@@ -4069,7 +4085,8 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
   // Scan a masked copy so string literals and comments can never be mistaken for a real
   // FROM/JOIN table reference; double-quoted table names survive masking (see
   // maskSqlLiteralsAndComments), so the returned table info built from `match` is unaffected.
-  const scanSql = maskSqlLiteralsAndComments(sql, databaseType);
+  // 掩码保持长度不变，match.index 才能和原始 SQL 的括号偏移对齐（作用域判定依赖这一点）。
+  const scanSql = maskSqlLiteralsAndComments(sql, databaseType, true);
   const referenced: SqlCompletionReferencedTable[] = [];
 
   const addReference = (rawName: string | undefined, alias: string | undefined, position?: number): void => {
@@ -4110,14 +4127,40 @@ function extractReferencedTables(sql: string, databaseType?: DatabaseType): SqlC
     addReference(match[1], alias, match.index);
 
     // Walk the rest of a comma-separated table list (`FROM a x, b (nolock) y`): the primary
-    // pattern only anchors on the introducer, so later entries need their own scan.
+    // pattern only anchors on the introducer, so later entries need their own scan. The list
+    // ends at the next clause/join keyword -- otherwise select-list or function-argument commas
+    // (`CONVERT(date, t2.`) would be read as table references.
+    const listEnd = tableListBoundaryIndex(scanSql, pattern.lastIndex);
     listEntryPattern.lastIndex = pattern.lastIndex;
     let entry: RegExpExecArray | null;
     while ((entry = listEntryPattern.exec(scanSql)) !== null) {
+      if (entry.index >= listEnd) break;
       addReference(entry[1], entry[2], entry.index);
     }
   }
   return referenced;
+}
+
+/**
+ * 只保留光标所在括号作用域里的表引用。SQL 中内层查询可以引用外层表（相关子查询），
+ * 但外层/兄弟子查询不应看到内层的表，否则 `SELECT ` / `t1.` 会把整条语句所有子查询
+ * 的字段都列出来。取光标最近的、确有表引用的作用域；CTE 在所有嵌套作用域里都可见。
+ */
+export function scopeReferencedTablesToCursor<T extends SqlCompletionReferencedTable>(referencedTables: readonly T[], sql: string, cursor: number, databaseType?: DatabaseType): T[] {
+  if (referencedTables.length <= 1) return [...referencedTables];
+  const cteTables = referencedTables.filter((table) => table.kind === "cte");
+  const candidates = referencedTables.filter((table) => table.kind !== "cte");
+  if (candidates.length <= 1) return [...referencedTables];
+  const scopeStarts = cursorScopeStarts(maskSqlLiteralsAndComments(sql, databaseType, true), cursor);
+  for (const scopeStart of scopeStarts) {
+    const visible = candidates.filter((table) => (table.scopeStart ?? -1) === scopeStart);
+    if (visible.length > 0) return [...cteTables, ...visible];
+  }
+  return [...referencedTables];
+}
+
+export function referencedTableScopeStart(sql: string, position: number, databaseType?: DatabaseType): number {
+  return enclosingParenStart(maskSqlLiteralsAndComments(sql, databaseType, true), position);
 }
 
 /** Offset of the innermost `(` enclosing `position`, or -1 when the position is top-level. */
@@ -4141,8 +4184,9 @@ function cursorScopeStarts(maskedSql: string, cursor: number): number[] {
     if (ch === "(") stack.push(i);
     else if (ch === ")" && stack.length > 0) stack.pop();
   }
+  stack.reverse();
   stack.push(-1);
-  return stack.reverse();
+  return stack;
 }
 
 /**
@@ -4161,7 +4205,7 @@ function narrowReferencedTablesToCursorScope(referencedTables: SqlCompletionRefe
   const shadowed = [...byAlias.values()].filter((tables) => tables.length > 1);
   if (shadowed.length === 0) return referencedTables;
 
-  const scopeStarts = cursorScopeStarts(maskSqlLiteralsAndComments(sql, databaseType), cursor);
+  const scopeStarts = cursorScopeStarts(maskSqlLiteralsAndComments(sql, databaseType, true), cursor);
   const dropped = new Set<SqlCompletionReferencedTable>();
   for (const tables of shadowed) {
     let winner: SqlCompletionReferencedTable | undefined;
@@ -4580,6 +4624,7 @@ function maskResolvedCteBodies(statement: string, cursorOffset: number, ctes: re
 function extractSubqueryReferences(sql: string, knownCtes?: readonly ScannedCteDefinition[], databaseType?: DatabaseType): SqlCompletionReferencedTable[] {
   const refs: SqlCompletionReferencedTable[] = [];
   const pattern = /\b(?:from|join)\s*\(/gi;
+  let maskedSql: string | undefined;
 
   for (const match of sql.matchAll(pattern)) {
     const openParen = match.index! + match[0].length - 1;
@@ -4602,7 +4647,9 @@ function extractSubqueryReferences(sql: string, knownCtes?: readonly ScannedCteD
     const body = sql.slice(openParen + 1, closeParen);
     const columns = extractSelectColumnNames(body, knownCtes, databaseType);
 
-    refs.push({ name: alias, alias, columns });
+    // 派生表别名属于外层作用域：记录别名所在的括号深度，列补全时按光标作用域筛选。
+    maskedSql ??= maskSqlLiteralsAndComments(sql, databaseType, true);
+    refs.push({ name: alias, alias, columns, scopeStart: enclosingParenStart(maskedSql, pos) });
   }
 
   return refs;

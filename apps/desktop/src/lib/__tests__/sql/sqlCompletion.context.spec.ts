@@ -2582,7 +2582,9 @@ describe("line block statement boundary", () => {
     const cursor = sql.length;
     const context = getSqlCompletionContext(sql, cursor, { databaseType: "mysql" });
 
-    expect(context.referencedTables.map((table) => table.name)).toEqual(expect.arrayContaining(["users"]));
+    // 语句没有在内层 SELECT 行被截断：外层仍能看到派生表 x（users 只属于子查询作用域，
+    // 不应泄漏到外层的 where 子句）。
+    expect(context.referencedTables.map((table) => table.alias)).toEqual(expect.arrayContaining(["x"]));
   });
 
   it("keeps WITH clause in scope when cursor is in the following top-level main query", () => {
@@ -2601,6 +2603,57 @@ describe("line block statement boundary", () => {
 
     expect(context.referencedTables.some((t) => t.name === "other_table" || t.alias === "ot")).toBe(true);
     expect(context.referencedTables.some((t) => t.name === "cte")).toBe(false);
+  });
+});
+
+describe("column completion follows the cursor scope", () => {
+  const scopeOptions = {
+    databaseType: "sqlserver" as const,
+    dialect: "sqlserver" as const,
+    tables: [
+      { name: "OETT", schema: "dbo" },
+      { name: "OSHP", schema: "dbo" },
+      { name: "YValuDetail", schema: "dbo" },
+    ],
+    columnsByTable: new Map([
+      ["oett", ["shpEntry", "dayTarget", "workGroup"].map((name) => ({ name, table: "OETT" }))],
+      ["oshp", ["DocEntry", "shpName"].map((name) => ({ name, table: "OSHP" }))],
+      ["yvaluedetail", ["shpEntry", "priceOfDay", "docQty"].map((name) => ({ name, table: "YValuDetail" }))],
+    ]),
+  };
+
+  it("only suggests the tables of the subquery containing the cursor", () => {
+    const sql = `SELECT u.shpName, s.shpName, t1.
+FROM (SELECT t1.shpEntry, t2.shpName FROM OETT(nolock) t1 INNER JOIN OSHP(nolock) t2 ON t1.shpEntry = t2.DocEntry) u
+FULL JOIN (SELECT k.shpName, k.workGroup FROM
+SELECT t1.
+FROM YValuDetail(nolock) T1
+INNER JOIN OSHP(nolock) T03 ON T03.shpEntry = t1.DocEntry
+) s ON u.shpEntry = s.shpEntry`;
+    const cursor = sql.indexOf("\nSELECT t1.") + "\nSELECT t1.".length;
+    const context = getSqlCompletionContext(sql, cursor, scopeOptions);
+
+    expect(context.qualifier).toBe("t1");
+    expect(context.referencedTables.map((table) => table.alias)).toEqual(["T1", "T03"]);
+
+    const columns = buildSqlCompletionItems(sql, cursor, scopeOptions)
+      .filter((item) => item.type === "column")
+      .map((item) => item.label);
+    expect(columns).toEqual(expect.arrayContaining(["priceOfDay", "docQty"]));
+    // OETT 是外层/兄弟子查询里的 t1，不应出现在内层的字段候选里。
+    expect(columns).not.toContain("dayTarget");
+  });
+
+  it("opens field completion right after a typed comma", () => {
+    const sql = "SELECT shpEntry,shpName FROM OSHP";
+    const cursor = sql.indexOf(",") + 1;
+
+    expect(shouldAutoOpenSqlCompletion(sql, cursor, scopeOptions)).toBe(true);
+    expect(getSqlCompletionContext(sql, cursor, scopeOptions).suggestColumns).toBe(true);
+    const columns = buildSqlCompletionItems(sql, cursor, scopeOptions)
+      .filter((item) => item.type === "column")
+      .map((item) => item.label);
+    expect(columns).toEqual(expect.arrayContaining(["DocEntry", "shpName"]));
   });
 });
 

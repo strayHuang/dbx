@@ -1,4 +1,5 @@
 import type { SqlCompletionColumn, SqlCompletionContext, SqlCompletionReferencedTable } from "@/lib/sql/sqlCompletion";
+import { scopeReferencedTablesToCursor, referencedTableScopeStart } from "@/lib/sql/sqlCompletion";
 import { SQL_SEMANTIC_DIALECTS } from "@/lib/sql/semantic/dialect";
 import type { SqlSemanticModel, SqlSemanticRowSource, SqlSemanticSpan, SqlSemanticToken } from "@/lib/sql/semantic/types";
 
@@ -112,6 +113,8 @@ export function sqlSemanticReferencedTables(model: SqlSemanticModel): SqlComplet
         aliasSql: source.aliasSpan ? model.sql.slice(source.aliasSpan.start, source.aliasSpan.end) : source.alias,
         columns: source.columns,
         columnAliases: source.columnAliases,
+        // 别名的位置决定它属于哪个括号作用域；派生表没有别名时用右括号之后的位置。
+        scopeStart: referencedTableScopeStart(model.sql, source.aliasSpan?.start ?? (source.kind === "subquery" ? source.sourceSpan.end : source.sourceSpan.start), model.databaseType),
       };
     });
 }
@@ -352,7 +355,7 @@ export function sqlCompletionContextFromSemantic(model: SqlSemanticModel, base: 
   const prefix = useBaseTrailingIdentifier ? base.prefix : model.cursorIntent.prefix;
   const qualifierParts = model.cursorIntent.qualifierParts.length > 0 ? [...model.cursorIntent.qualifierParts] : useBaseTrailingIdentifier ? base.qualifierParts : undefined;
   const qualifier = qualifierParts?.join(".");
-  const referencedTables = sqlSemanticReferencedTables(model);
+  const referencedTables = scopeReferencedTablesToCursor(sqlSemanticReferencedTables(model), model.sql, model.cursor, model.databaseType);
   const mutationTarget = semanticMutationTarget(model);
   const mutationDatabase = mutationTarget?.metadataTarget?.database;
   const mutationSchema = mutationTarget?.qualifierParts[mutationTarget.qualifierParts.length - 1];
