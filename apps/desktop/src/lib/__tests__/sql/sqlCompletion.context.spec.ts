@@ -2655,6 +2655,19 @@ INNER JOIN OSHP(nolock) T03 ON T03.shpEntry = t1.DocEntry
       .map((item) => item.label);
     expect(columns).toEqual(expect.arrayContaining(["DocEntry", "shpName"]));
   });
+
+  it("does not suggest FROM when the current block already has a from clause", () => {
+    const sql = `select t1,
+from YValuDetail(nolock) T1
+inner JOIN OSHP(nolock) T03 on T03.shpEntry = t1.DocEntry`;
+    const cursor = sql.indexOf("t1,") + "t1,".length;
+    const context = getSqlCompletionContext(sql, cursor, scopeOptions);
+
+    expect(context.presentClauseKeywords?.has("FROM")).toBe(true);
+    const items = buildSqlCompletionItems(sql, cursor, scopeOptions);
+    expect(items.some((item) => item.type === "keyword" && item.label.toUpperCase() === "FROM")).toBe(false);
+    expect(items.some((item) => item.type === "column")).toBe(true);
+  });
 });
 
 describe("select-list function argument completion", () => {

@@ -1691,6 +1691,8 @@ export interface SqlCompletionContext {
   selectListColumnContext: boolean;
   selectListWildcardAfterCursor?: boolean;
   preferredKeywords: string[];
+  /** 当前语句作用域里已经出现过的子句关键字（如 FROM/WHERE），补全时不再重复提示。 */
+  presentClauseKeywords?: ReadonlySet<string>;
   updateTarget?: { table: string; schema?: string };
   deleteTarget?: { table: string; schema?: string };
   oracleTableFunctionContext?: boolean;
@@ -1953,8 +1955,10 @@ class SqlCompletionProvider {
       );
     }
 
-    if (context.preferredKeywords.length > 0) {
-      this.items.push(...buildPreferredKeywordItems(context.prefix, context.preferredKeywords, this.input.keywordCase));
+    // 首选关键字同样要跳过当前块里已经写过的子句：`select t1,` 后方已有 from 时不再首选 FROM。
+    const preferredKeywords = context.preferredKeywords.filter((keyword) => !context.presentClauseKeywords?.has(keyword.toUpperCase()));
+    if (preferredKeywords.length > 0) {
+      this.items.push(...buildPreferredKeywordItems(context.prefix, preferredKeywords, this.input.keywordCase));
     }
 
     if (!pendingJoinKeyword && context.suggestColumns && !context.qualifier && !context.insertTable && context.prefix) {
@@ -2973,6 +2977,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
     selectListColumnContext,
     selectListWildcardAfterCursor,
     preferredKeywords,
+    presentClauseKeywords: presentClauseKeywords(fullStatement, cursorInStatement, options.databaseType, prefix.length),
     updateTarget: updateInfo?.target,
     deleteTarget: deleteInfo?.target,
     oracleTableFunctionContext,
@@ -4161,6 +4166,68 @@ export function scopeReferencedTablesToCursor<T extends SqlCompletionReferencedT
 
 export function referencedTableScopeStart(sql: string, position: number, databaseType?: DatabaseType): number {
   return enclosingParenStart(maskSqlLiteralsAndComments(sql, databaseType, true), position);
+}
+
+const CLAUSE_KEYWORD_TESTS: ReadonlyArray<readonly [string, RegExp]> = [
+  ["FROM", /\bfrom\b/i],
+  ["WHERE", /\bwhere\b/i],
+  ["GROUP BY", /\bgroup\s+by\b/i],
+  ["ORDER BY", /\border\s+by\b/i],
+  ["HAVING", /\bhaving\b/i],
+  ["LIMIT", /\blimit\b/i],
+  ["OFFSET", /\boffset\b/i],
+  ["UNION", /\bunion\b/i],
+];
+
+/**
+ * 光标所在语句作用域里已经写过的子句关键字。`select t1,` 后面紧跟着 `from YValuDetail...`
+ * 时不应该再提示 `FROM`；同理 WHERE/GROUP BY 等也不该在一个块里重复提示。
+ * `typedPrefixLength` 用于排除光标处正在输入的关键字本身：`SELECT id from` 里的 `from`
+ * 是待补全的前缀，不是已经写好的子句，仍应提示 `FROM` 供大小写转换。
+ */
+export function presentClauseKeywords(sql: string, cursor: number, databaseType?: DatabaseType, typedPrefixLength = 0): Set<string> {
+  const masked = maskSqlLiteralsAndComments(sql, databaseType, true);
+  const typedEnd = Math.max(0, Math.min(cursor, masked.length));
+  const typedStart = Math.max(0, typedEnd - typedPrefixLength);
+  const scopeText = `${masked.slice(0, typedStart)}${" ".repeat(typedEnd - typedStart)}${masked.slice(typedEnd)}`;
+  const surface = currentScopeSurface(scopeText, cursor);
+  const present = new Set<string>();
+  for (const [keyword, pattern] of CLAUSE_KEYWORD_TESTS) {
+    if (pattern.test(surface)) present.add(keyword);
+  }
+  return present;
+}
+
+/** 当前括号作用域的文本，嵌套括号（子查询/函数参数）内容被抹成空格。 */
+function currentScopeSurface(maskedSql: string, cursor: number): string {
+  const scopes = cursorScopeStarts(maskedSql, cursor);
+  const open = scopes[0] ?? -1;
+  const start = open === -1 ? 0 : open + 1;
+  let depth = 0;
+  let end = maskedSql.length;
+  for (let i = start; i < maskedSql.length; i += 1) {
+    if (maskedSql[i] === "(") depth += 1;
+    else if (maskedSql[i] === ")" && depth > 0) depth -= 1;
+    else if (maskedSql[i] === ")") {
+      end = i;
+      break;
+    }
+  }
+  let surface = "";
+  depth = 0;
+  for (let i = start; i < end; i += 1) {
+    const ch = maskedSql[i];
+    if (ch === "(") {
+      depth += 1;
+      surface += " ";
+    } else if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      surface += " ";
+    } else {
+      surface += depth === 0 ? ch : " ";
+    }
+  }
+  return surface;
 }
 
 /** Offset of the innermost `(` enclosing `position`, or -1 when the position is top-level. */
@@ -6826,6 +6893,7 @@ function buildKeywordItems(prefix: string, context: SqlCompletionContext, databa
       const expressionType = expressionTypeDatabase && POSTGRES_EXPRESSION_TYPE_KEYWORDS.has(keyword.toUpperCase());
       if (!showDdl && isDml && (DDL_ONLY_KEYWORDS.has(keyword) || (DATA_TYPE_KEYWORDS.has(keyword) && !expressionType))) return false;
       if (context.followingKeyword && keyword.includes(" ") && keyword.toUpperCase().endsWith(` ${context.followingKeyword}`)) return false;
+      if (context.presentClauseKeywords?.has(keyword.toUpperCase())) return false;
       return true;
     })
     .map((keyword) => {
